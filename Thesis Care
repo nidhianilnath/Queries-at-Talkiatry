@@ -1,0 +1,65 @@
+----<DJB - Latest JSON>----
+WITH document_assignees AS (
+    SELECT
+        document_id
+      , document_log_action_at
+      , PARSE_JSON(document_log_data_json):assignedTo::string AS document_assigned_to
+      , document_log_data_json
+    FROM analytics.staging.stg_ecw_documents_log
+    WHERE document_log_data_json ILIKE '%assignedTo%'
+      AND document_log_action_at >= current_date - 60
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY document_id 
+        ORDER BY document_log_action_at DESC
+    ) = 1
+)
+
+, document_review_logs AS (
+    SELECT
+        document_id
+      , document_log_action_at
+      , PARSE_JSON(document_log_data_json):documentReviewed::string AS document_reviewed
+      , document_log_data_json
+    FROM analytics.staging.stg_ecw_documents_log
+    WHERE document_log_data_json ILIKE '%documentReviewed%'
+      AND document_log_action_at >= current_date - 60
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY document_id 
+        ORDER BY document_log_action_at DESC
+    ) = 1
+)
+
+SELECT
+    d.document_id
+  , d.patient_id
+  , d.document_scanned_date
+  , d.document_reviewer_name
+  , d.is_document_reviewed
+  , da.document_assigned_to                     AS parsed_json_assigned_to
+  , da.document_log_action_at                   AS assigned_to_admin_support_at
+  , da.document_log_data_json                   AS full_json_assigned_to
+  , dr.document_reviewed                        AS parsed_json_document_reviewed
+  , dr.document_log_action_at                   AS document_reviewed_at
+  , dr.document_log_data_json                   AS full_json_document_reviewed
+
+FROM analytics.staging.stg_ecw_document d
+LEFT JOIN document_assignees da 
+    ON da.document_id = d.document_id
+LEFT JOIN document_review_logs dr 
+    ON dr.document_id = d.document_id
+
+WHERE d.document_scanned_date >= current_date - 60
+  AND d.document_reviewer_name ILIKE 'admin,support'
+  AND d.is_document_reviewed = 0
+;
+
+----<TJB>-----
+select *
+
+from ANALYTICS.COMMON.FCT_TELEPHONE_ENCOUNTERS t
+
+where 1=1 
+    AND encounter_date >= current_date - 60
+    AND TELEPHONE_ENCOUNTER_ASSIGNED_TO_USER_NAME ilike '%admin,support%'
+    AND is_telephone_encounter_locked = 0
+;
