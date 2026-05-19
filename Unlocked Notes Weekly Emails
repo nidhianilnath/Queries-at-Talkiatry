@@ -1,0 +1,1444 @@
+---<1: Providers>----
+WITH current_employees AS (
+  SELECT
+      employee_npi
+    , MAX(employee_preferred_name)  AS provider_name
+    , MAX(employee_email)           AS provider_email
+    , MAX(employee_supervisor_name) AS supervisor_name
+  FROM analytics.common.dim_employees
+  WHERE employee_separation_date IS NULL
+    AND employee_status = 'Active'
+  GROUP BY 1
+)
+
+, base_visits AS (
+  /* Last 365d, visit started >72h ago, billable, and specific statuses */
+  SELECT DISTINCT
+      fv.visit_id
+    , fv.visit_provider_npi
+    , fv.patient_id                                AS mrn
+    , CAST(fv.visit_date AS DATE)                  AS visit_date
+    , fv.visit_start_datetime
+    , fv.visit_status
+    , COALESCE(fv.is_visit_note_locked, 0)         AS is_visit_note_locked
+  FROM analytics.common.fct_visits fv
+  WHERE
+        CAST(fv.visit_date AS DATE) >= DATEADD('day', -365, CURRENT_DATE)
+    AND fv.visit_start_datetime <= DATEADD('hour', -72, CURRENT_TIMESTAMP)
+    AND COALESCE(fv.is_visit_billable, 0) = 1
+    AND UPPER(COALESCE(fv.visit_status, '')) IN 
+        ('CHK', 'ARR', 'LATE CANC', 'NO SHOW', 'PEN')
+)
+
+, dedup AS (
+  SELECT *
+  FROM (
+    SELECT
+        visit_id
+      , visit_provider_npi
+      , mrn
+      , visit_date
+      , visit_start_datetime
+      , visit_status
+      , is_visit_note_locked
+      , ROW_NUMBER() OVER (
+            PARTITION BY visit_id 
+            ORDER BY visit_start_datetime DESC
+        ) AS rn
+    FROM base_visits
+  )
+  WHERE rn = 1
+)
+
+, coding_flags AS (
+  SELECT
+      cca.encounter_id AS visit_id
+    , MAX(cca.documentation_error) AS documentation_error
+    , MAX(
+        CASE
+          WHEN NULLIF(TRIM(cca.documentation_error), '') IS NOT NULL THEN 1
+          ELSE 0
+        END
+      ) AS has_doc_error
+    , MAX(CASE WHEN cca.last_locked_at IS NOT NULL THEN 1 ELSE 0 END) AS was_ever_locked
+    , MAX(cca.last_locked_at) AS last_locked_at
+  FROM analytics.products.candid_coding_analytics cca
+  GROUP BY 1
+)
+
+/* ---------- Last 3 full months: monthly % notes closed within 72h ---------- */
+, note_timeliness_monthly AS (
+  SELECT
+      ce.employee_npi
+    , DATE_TRUNC('month', d.visit_date) AS visit_month
+    , COUNT(*) AS total_notes_month
+    , COUNT_IF(
+          cf.last_locked_at IS NOT NULL
+      AND cf.last_locked_at <= DATEADD('hour', 72, d.visit_start_datetime)
+      ) AS notes_closed_in_72h_month
+    , 100.0 * COUNT_IF(
+          cf.last_locked_at IS NOT NULL
+      AND cf.last_locked_at <= DATEADD('hour', 72, d.visit_start_datetime)
+      ) / NULLIF(COUNT(*), 0) AS pct_notes_closed_in_72h_month
+  FROM dedup d
+  JOIN current_employees ce
+    ON d.visit_provider_npi = ce.employee_npi
+  LEFT JOIN coding_flags cf
+    ON d.visit_id = cf.visit_id
+  WHERE d.visit_date >= DATE_TRUNC('month', DATEADD('month', -3, CURRENT_DATE))
+    AND d.visit_date < DATE_TRUNC('month', CURRENT_DATE)
+    AND UPPER(COALESCE(ce.supervisor_name, '')) NOT IN (
+          'ALLISON HOLT'
+        , 'ROBERT KRAYN'
+        , 'GEORGIA GAVERAS'
+        , 'DAVID GUGGENHEIM'
+    )
+  GROUP BY
+      ce.employee_npi
+    , DATE_TRUNC('month', d.visit_date)
+)
+
+, note_timeliness_3m_avg AS (
+  SELECT
+      employee_npi
+    , AVG(pct_notes_closed_in_72h_month) AS avg_pct_notes_closed_in_72h_last_3m
+  FROM note_timeliness_monthly
+  GROUP BY 1
+)
+
+SELECT
+    ce.provider_name
+  , ce.provider_email
+
+  /* ---------- NEW COLUMN ---------- */
+  , ROUND(nt.avg_pct_notes_closed_in_72h_last_3m, 1) AS avg_pct_notes_closed_in_72h_last_3m
+
+  /* ---------- COUNTS ---------- */
+  , COUNT_IF(
+      d.is_visit_note_locked = 0
+      AND COALESCE(cf.was_ever_locked, 0) = 0
+      AND COALESCE(cf.has_doc_error, 0) = 0
+    ) AS unlocked_notes_complete_cnt
+
+  , COUNT_IF(
+      d.is_visit_note_locked = 0
+      AND COALESCE(cf.was_ever_locked, 0) = 0
+      AND COALESCE(cf.has_doc_error, 0) = 1
+    ) AS unlocked_notes_incomplete_cnt
+
+  , COUNT_IF(
+      d.is_visit_note_locked = 0
+      AND COALESCE(cf.was_ever_locked, 0) = 1
+      AND COALESCE(cf.has_doc_error, 0) = 1
+    ) AS autocoded_unlocked_notes_cnt
+
+  , COUNT_IF(
+      d.is_visit_note_locked = 1
+      AND COALESCE(cf.has_doc_error, 0) = 1
+      AND d.visit_date >= DATEADD('day', -45, CURRENT_DATE)
+    ) AS autocoded_locked_notes_cnt
+
+  , (
+        COUNT_IF(
+          d.is_visit_note_locked = 0
+          AND COALESCE(cf.was_ever_locked, 0) = 0
+          AND COALESCE(cf.has_doc_error, 0) = 0
+        )
+      + COUNT_IF(
+          d.is_visit_note_locked = 0
+          AND COALESCE(cf.was_ever_locked, 0) = 0
+          AND COALESCE(cf.has_doc_error, 0) = 1
+        )
+      + COUNT_IF(
+          d.is_visit_note_locked = 0
+          AND COALESCE(cf.was_ever_locked, 0) = 1
+          AND COALESCE(cf.has_doc_error, 0) = 1
+        )
+      + COUNT_IF(
+          d.is_visit_note_locked = 1
+          AND COALESCE(cf.has_doc_error, 0) = 1
+          AND d.visit_date >= DATEADD('day', -45, CURRENT_DATE)
+        )
+    ) AS total_notes_cnt
+
+  /* ---------- DETAIL OUTPUT ---------- */
+  , LISTAGG(
+      CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 0
+         AND COALESCE(cf.has_doc_error, 0) = 0
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+      END
+      , '\n'
+    ) WITHIN GROUP (ORDER BY d.visit_start_datetime, d.visit_id) 
+    AS unlocked_notes_complete
+
+  , LISTAGG(
+      CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 0
+         AND COALESCE(cf.has_doc_error, 0) = 1
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' 
+             || COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation')
+      END
+      , '\n'
+    ) WITHIN GROUP (ORDER BY d.visit_start_datetime, d.visit_id) 
+    AS unlocked_notes_incomplete
+
+  , LISTAGG(
+      CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 1
+         AND COALESCE(cf.has_doc_error, 0) = 1
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' 
+             || COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation')
+      END
+      , '\n'
+    ) WITHIN GROUP (ORDER BY d.visit_start_datetime, d.visit_id) 
+    AS autocoded_unlocked_notes
+
+  , LISTAGG(
+      CASE
+        WHEN d.is_visit_note_locked = 1
+         AND COALESCE(cf.has_doc_error, 0) = 1
+         AND d.visit_date >= DATEADD('day', -45, CURRENT_DATE)
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' 
+             || COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation')
+      END
+      , '\n'
+    ) WITHIN GROUP (ORDER BY d.visit_start_datetime, d.visit_id) 
+    AS autocoded_locked_notes
+
+FROM dedup d
+JOIN current_employees ce
+  ON d.visit_provider_npi = ce.employee_npi
+LEFT JOIN coding_flags cf
+  ON d.visit_id = cf.visit_id
+LEFT JOIN note_timeliness_3m_avg nt
+  ON ce.employee_npi = nt.employee_npi
+WHERE UPPER(ce.supervisor_name) NOT IN (
+          'ALLISON HOLT'
+        , 'ROBERT KRAYN'
+        , 'GEORGIA GAVERAS'
+        , 'DAVID GUGGENHEIM'
+      )
+GROUP BY
+    ce.provider_name
+  , ce.provider_email
+  , nt.avg_pct_notes_closed_in_72h_last_3m
+HAVING total_notes_cnt > 0
+ORDER BY total_notes_cnt DESC NULLS LAST;
+
+
+---<2: Chiefs>----
+WITH current_employees AS (
+  SELECT
+      employee_npi
+    , MAX(employee_preferred_name)   AS provider_name
+    , MAX(employee_email)            AS provider_email
+    , MAX(employee_supervisor_name)  AS chief_name
+    , MAX(employee_supervisor_email) AS chief_email
+  FROM analytics.common.dim_employees
+  WHERE employee_separation_date IS NULL
+    AND employee_status = 'Active'
+  GROUP BY 1
+)
+
+, base_visits AS (
+  /* Last 365d, visit started >72h ago, billable, specific statuses */
+  SELECT DISTINCT
+      fv.visit_id
+    , fv.visit_provider_npi
+    , fv.patient_id                                AS mrn
+    , CAST(fv.visit_date AS DATE)                  AS visit_date
+    , fv.visit_start_datetime
+    , fv.visit_status
+    , COALESCE(fv.is_visit_note_locked, 0)         AS is_visit_note_locked
+  FROM analytics.common.fct_visits fv
+  WHERE
+        CAST(fv.visit_date AS DATE) >= DATEADD('day', -365, CURRENT_DATE)
+    AND fv.visit_start_datetime <= DATEADD('hour', -72, CURRENT_TIMESTAMP)
+    AND COALESCE(fv.is_visit_billable, 0) = 1
+    AND UPPER(COALESCE(fv.visit_status, '')) IN (
+          'CHK'
+        , 'ARR'
+        , 'LATE CANC'
+        , 'NO SHOW'
+        , 'PEN'
+    )
+)
+
+, dedup AS (
+  SELECT *
+  FROM (
+    SELECT
+        visit_id
+      , visit_provider_npi
+      , mrn
+      , visit_date
+      , visit_start_datetime
+      , visit_status
+      , is_visit_note_locked
+      , ROW_NUMBER() OVER (
+            PARTITION BY visit_id
+            ORDER BY visit_start_datetime DESC
+        ) AS rn
+    FROM base_visits
+  )
+  WHERE rn = 1
+)
+
+, coding_flags AS (
+  SELECT
+      cca.encounter_id AS visit_id
+    , MAX(cca.documentation_error) AS documentation_error
+    , MAX(
+        CASE
+          WHEN NULLIF(TRIM(cca.documentation_error), '') IS NOT NULL THEN 1
+          ELSE 0
+        END
+      ) AS has_doc_error
+    , MAX(CASE WHEN cca.last_locked_at IS NOT NULL THEN 1 ELSE 0 END) AS was_ever_locked
+    , MAX(cca.last_locked_at) AS last_locked_at
+  FROM analytics.products.candid_coding_analytics cca
+  GROUP BY 1
+)
+
+/* ---------- 3-month avg % closed within 72h ---------- */
+, note_timeliness_monthly AS (
+  SELECT
+      ce.employee_npi
+    , DATE_TRUNC('month', d.visit_date) AS visit_month
+    , COUNT(*) AS total_notes_month
+    , COUNT_IF(
+          cf.last_locked_at IS NOT NULL
+      AND cf.last_locked_at <= DATEADD('hour', 72, d.visit_start_datetime)
+      ) AS notes_closed_in_72h_month
+    , 100.0 * COUNT_IF(
+          cf.last_locked_at IS NOT NULL
+      AND cf.last_locked_at <= DATEADD('hour', 72, d.visit_start_datetime)
+      ) / NULLIF(COUNT(*), 0) AS pct_notes_closed_in_72h_month
+  FROM dedup d
+  JOIN current_employees ce
+    ON d.visit_provider_npi = ce.employee_npi
+  LEFT JOIN coding_flags cf
+    ON d.visit_id = cf.visit_id
+  WHERE d.visit_date >= DATE_TRUNC('month', DATEADD('month', -3, CURRENT_DATE))
+    AND d.visit_date < DATE_TRUNC('month', CURRENT_DATE)
+  GROUP BY
+      ce.employee_npi
+    , DATE_TRUNC('month', d.visit_date)
+)
+
+, note_timeliness_3m_avg AS (
+  SELECT
+      employee_npi
+    , AVG(pct_notes_closed_in_72h_month) AS avg_pct_closed_in_72h_last_3m
+  FROM note_timeliness_monthly
+  GROUP BY 1
+)
+
+, visits_labeled AS (
+  SELECT
+      d.visit_id
+    , d.mrn
+    , d.visit_date
+    , d.visit_start_datetime
+    , d.visit_status
+    , d.is_visit_note_locked
+
+    , ce.employee_npi
+    , ce.provider_name
+    , ce.provider_email
+    , ce.chief_name
+    , ce.chief_email
+
+    , COALESCE(cf.has_doc_error, 0)   AS has_doc_error
+    , COALESCE(cf.was_ever_locked, 0) AS was_ever_locked
+    , COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation') AS documentation_error
+
+    /* 1) Unlocked Notes – Complete */
+    , CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 0
+         AND COALESCE(cf.has_doc_error, 0) = 0
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+      END AS unlocked_notes_complete_entry
+
+    /* 2) Unlocked Notes – Incomplete */
+    , CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 0
+         AND COALESCE(cf.has_doc_error, 0) = 1
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' || documentation_error
+      END AS unlocked_notes_incomplete_entry
+
+    /* 3) Autocoded Unlocked Notes */
+    , CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 1
+         AND COALESCE(cf.has_doc_error, 0) = 1
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' || documentation_error
+      END AS autocoded_unlocked_notes_entry
+
+    /* 4) Autocoded Locked Notes */
+    , CASE
+        WHEN d.is_visit_note_locked = 1
+         AND COALESCE(cf.has_doc_error, 0) = 1
+         AND d.visit_date >= DATEADD('day', -45, CURRENT_DATE)
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' || documentation_error
+      END AS autocoded_locked_notes_entry
+
+  FROM dedup d
+  JOIN current_employees ce
+    ON d.visit_provider_npi = ce.employee_npi
+  LEFT JOIN coding_flags cf
+    ON d.visit_id = cf.visit_id
+)
+
+, provider_rollup AS (
+  SELECT
+      vl.chief_name
+    , vl.chief_email
+    , vl.provider_name
+    , vl.provider_email
+    , ROUND(nt.avg_pct_closed_in_72h_last_3m, 1) AS avg_pct_closed_in_72h_last_3m
+
+    , COUNT_IF(vl.unlocked_notes_complete_entry IS NOT NULL)   AS unlocked_notes_complete_cnt
+    , COUNT_IF(vl.unlocked_notes_incomplete_entry IS NOT NULL) AS unlocked_notes_incomplete_cnt
+    , COUNT_IF(vl.autocoded_unlocked_notes_entry IS NOT NULL)  AS autocoded_unlocked_notes_cnt
+    , COUNT_IF(vl.autocoded_locked_notes_entry IS NOT NULL)    AS autocoded_locked_notes_cnt
+
+    , (
+        COUNT_IF(vl.unlocked_notes_complete_entry IS NOT NULL)
+      + COUNT_IF(vl.unlocked_notes_incomplete_entry IS NOT NULL)
+      + COUNT_IF(vl.autocoded_unlocked_notes_entry IS NOT NULL)
+      + COUNT_IF(vl.autocoded_locked_notes_entry IS NOT NULL)
+      ) AS provider_total_notes_cnt
+
+    , LISTAGG(vl.unlocked_notes_complete_entry, '\n')
+        WITHIN GROUP (ORDER BY vl.visit_start_datetime, vl.visit_id) AS unlocked_notes_complete
+
+    , LISTAGG(vl.unlocked_notes_incomplete_entry, '\n')
+        WITHIN GROUP (ORDER BY vl.visit_start_datetime, vl.visit_id) AS unlocked_notes_incomplete
+
+    , LISTAGG(vl.autocoded_unlocked_notes_entry, '\n')
+        WITHIN GROUP (ORDER BY vl.visit_start_datetime, vl.visit_id) AS autocoded_unlocked_notes
+
+    , LISTAGG(vl.autocoded_locked_notes_entry, '\n')
+        WITHIN GROUP (ORDER BY vl.visit_start_datetime, vl.visit_id) AS autocoded_locked_notes
+
+  FROM visits_labeled vl
+  LEFT JOIN note_timeliness_3m_avg nt
+    ON vl.employee_npi = nt.employee_npi
+  GROUP BY
+      vl.chief_name
+    , vl.chief_email
+    , vl.provider_name
+    , vl.provider_email
+    , nt.avg_pct_closed_in_72h_last_3m
+  HAVING provider_total_notes_cnt > 0
+)
+
+, chief_rollup AS (
+  SELECT
+      chief_name
+    , chief_email
+    , SUM(provider_total_notes_cnt) AS chief_total_notes_cnt
+
+    , LISTAGG(
+          provider_name || ' - Total: ' || provider_total_notes_cnt
+          || CHR(10) || '  • Unlocked Complete: '   || unlocked_notes_complete_cnt
+          || CHR(10) || '  • Unlocked Incomplete: ' || unlocked_notes_incomplete_cnt
+          || CHR(10) || '  • Autocoded Unlocked: '  || autocoded_unlocked_notes_cnt
+          || CHR(10) || '  • Autocoded Locked: '    || autocoded_locked_notes_cnt
+          || CHR(10) || '  • % closed within 72 hours: '
+          || COALESCE(TO_VARCHAR(avg_pct_closed_in_72h_last_3m), 'N/A') || '%'
+        , '\n\n'
+      ) WITHIN GROUP (ORDER BY provider_total_notes_cnt DESC, provider_name)
+      AS providers_and_counts
+
+  FROM provider_rollup
+  GROUP BY
+      chief_name
+    , chief_email
+)
+
+SELECT
+    cr.chief_name
+  , cr.chief_email
+  , cr.chief_total_notes_cnt
+  , cr.providers_and_counts
+FROM chief_rollup cr
+WHERE UPPER(cr.chief_name) NOT IN (
+          'ALLISON HOLT'
+        , 'ROBERT KRAYN'
+        , 'GEORGIA GAVERAS'
+        , 'DAVID GUGGENHEIM'
+      )
+  AND cr.chief_total_notes_cnt > 0
+ORDER BY
+    cr.chief_total_notes_cnt DESC
+  , cr.chief_name;
+
+---<GM>----
+
+WITH current_employees AS (
+  -- Active providers with their chief mapping
+  SELECT
+      employee_npi
+    , MAX(employee_full_name)        AS provider_name
+    , MAX(employee_email)            AS provider_email
+    , MAX(employee_supervisor_name)  AS chief_name
+    , MAX(employee_supervisor_email) AS chief_email
+  FROM analytics.common.dim_employees
+  WHERE employee_separation_date IS NULL
+    AND employee_status = 'Active'
+  GROUP BY 1
+)
+
+, base_visits AS (
+  -- Last 365d, >72h old, billable, and specific visit statuses (includes locked + unlocked)
+  SELECT DISTINCT
+      fv.visit_id
+    , fv.visit_provider_npi
+    , fv.patient_id                        AS mrn
+    , CAST(fv.visit_date AS DATE)          AS visit_date
+    , fv.visit_start_datetime
+    , fv.visit_status
+    , COALESCE(fv.is_visit_note_locked, 0) AS is_visit_note_locked
+  FROM analytics.common.fct_visits fv
+  WHERE
+        CAST(fv.visit_date AS DATE) >= DATEADD('day', -365, CURRENT_DATE)
+    AND fv.visit_start_datetime <= DATEADD('hour', -72, CURRENT_TIMESTAMP)
+    AND COALESCE(fv.is_visit_billable, 0) = 1
+    AND UPPER(COALESCE(fv.visit_status, '')) IN ('CHK','ARR','LATE CANC','NO SHOW','PEN')
+)
+
+, dedup AS (
+  -- Defensive: one row per visit_id
+  SELECT *
+  FROM (
+    SELECT
+        visit_id
+      , visit_provider_npi
+      , mrn
+      , visit_date
+      , visit_start_datetime
+      , visit_status
+      , is_visit_note_locked
+      , ROW_NUMBER() OVER (PARTITION BY visit_id ORDER BY visit_date DESC) AS rn
+    FROM base_visits
+  )
+  WHERE rn = 1
+)
+
+, coding_flags AS (
+  -- Join to Candid coding analytics to identify documentation issues (do NOT filter out locked)
+  SELECT
+      cca.encounter_id AS visit_id
+    , MAX(cca.documentation_error) AS documentation_error
+    , MAX(
+        CASE
+          WHEN NULLIF(TRIM(cca.documentation_error), '') IS NOT NULL THEN 1
+          ELSE 0
+        END
+      ) AS has_doc_error
+    , MAX(CASE WHEN cca.last_locked_at IS NOT NULL THEN 1 ELSE 0 END) AS was_ever_locked
+    , MAX(cca.last_locked_at) AS last_locked_at
+  FROM analytics.products.candid_coding_analytics cca
+  GROUP BY 1
+)
+
+, note_timeliness_monthly AS (
+  SELECT
+      ce.employee_npi
+    , DATE_TRUNC('month', d.visit_date) AS visit_month
+    , COUNT(*) AS total_notes_month
+    , COUNT_IF(
+          cf.last_locked_at IS NOT NULL
+      AND cf.last_locked_at <= DATEADD('hour', 72, d.visit_start_datetime)
+      ) AS notes_closed_in_72h_month
+    , 100.0 * COUNT_IF(
+          cf.last_locked_at IS NOT NULL
+      AND cf.last_locked_at <= DATEADD('hour', 72, d.visit_start_datetime)
+      ) / NULLIF(COUNT(*), 0) AS pct_notes_closed_in_72h_month
+  FROM dedup d
+  JOIN current_employees ce
+    ON d.visit_provider_npi = ce.employee_npi
+  LEFT JOIN coding_flags cf
+    ON d.visit_id = cf.visit_id
+  WHERE d.visit_date >= DATE_TRUNC('month', DATEADD('month', -3, CURRENT_DATE))
+    AND d.visit_date < DATE_TRUNC('month', CURRENT_DATE)
+  GROUP BY
+      ce.employee_npi
+    , DATE_TRUNC('month', d.visit_date)
+)
+
+, note_timeliness_3m_avg AS (
+  SELECT
+      employee_npi
+    , AVG(pct_notes_closed_in_72h_month) AS avg_pct_closed_in_72h_last_3m
+  FROM note_timeliness_monthly
+  GROUP BY 1
+)
+
+, visits_labeled AS (
+  -- Add provider & chief context + classify each visit into the 4 buckets
+  SELECT
+      d.visit_id
+    , d.mrn
+    , d.visit_date
+    , d.visit_start_datetime
+    , d.visit_status
+    , d.is_visit_note_locked
+
+    , ce.employee_npi
+    , ce.provider_name
+    , ce.provider_email
+    , ce.chief_name
+    , ce.chief_email
+
+    , COALESCE(cf.has_doc_error, 0)   AS has_doc_error
+    , COALESCE(cf.was_ever_locked, 0) AS was_ever_locked
+    , COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation') AS documentation_error
+
+    /* 1) Unlocked Notes – Complete (detailed) */
+    , CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 0
+         AND COALESCE(cf.has_doc_error, 0) = 0
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+      END AS unlocked_notes_complete_entry
+
+    /* 2) Unlocked Notes – Incomplete (detailed) */
+    , CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 0
+         AND COALESCE(cf.has_doc_error, 0) = 1
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' || COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation')
+      END AS unlocked_notes_incomplete_entry
+
+    /* 3) Autocoded Unlocked Notes (detailed) */
+    , CASE
+        WHEN d.is_visit_note_locked = 0
+         AND COALESCE(cf.was_ever_locked, 0) = 1
+         AND COALESCE(cf.has_doc_error, 0) = 1
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' || COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation')
+      END AS autocoded_unlocked_notes_entry
+
+    /* 4) Autocoded Locked Notes (detailed) */
+    , CASE
+        WHEN d.is_visit_note_locked = 1
+         AND COALESCE(cf.has_doc_error, 0) = 1
+         AND d.visit_date >= DATEADD('day', -45, CURRENT_DATE)
+        THEN d.mrn || ' - ' || TO_CHAR(d.visit_date, 'YYYY-MM-DD')
+             || ' - Status: ' || COALESCE(d.visit_status, 'Unknown')
+             || ' - Visit ID: ' || d.visit_id
+             || ' - Missing: ' || COALESCE(NULLIF(TRIM(cf.documentation_error), ''), 'Missing documentation')
+      END AS autocoded_locked_notes_entry
+
+  FROM dedup d
+  JOIN current_employees ce
+    ON d.visit_provider_npi = ce.employee_npi
+  LEFT JOIN coding_flags cf
+    ON d.visit_id = cf.visit_id
+)
+
+, provider_rollup AS (
+  -- Per-provider counts, totals, and categorized lists
+  SELECT
+      vl.chief_name
+    , vl.chief_email
+    , vl.provider_name
+    , vl.provider_email
+    , ROUND(nt.avg_pct_closed_in_72h_last_3m, 1) AS avg_pct_closed_in_72h_last_3m
+
+    , COUNT_IF(vl.unlocked_notes_complete_entry IS NOT NULL)   AS unlocked_notes_complete_cnt
+    , COUNT_IF(vl.unlocked_notes_incomplete_entry IS NOT NULL) AS unlocked_notes_incomplete_cnt
+    , COUNT_IF(vl.autocoded_unlocked_notes_entry IS NOT NULL)  AS autocoded_unlocked_notes_cnt
+    , COUNT_IF(vl.autocoded_locked_notes_entry IS NOT NULL)    AS autocoded_locked_notes_cnt
+
+    , (
+        COUNT_IF(vl.unlocked_notes_complete_entry IS NOT NULL)
+      + COUNT_IF(vl.unlocked_notes_incomplete_entry IS NOT NULL)
+      + COUNT_IF(vl.autocoded_unlocked_notes_entry IS NOT NULL)
+      + COUNT_IF(vl.autocoded_locked_notes_entry IS NOT NULL)
+      ) AS provider_total_notes_cnt
+
+    , LISTAGG(vl.unlocked_notes_complete_entry, '\n')   WITHIN GROUP (ORDER BY vl.visit_date, vl.visit_id) AS unlocked_notes_complete
+    , LISTAGG(vl.unlocked_notes_incomplete_entry, '\n') WITHIN GROUP (ORDER BY vl.visit_date, vl.visit_id) AS unlocked_notes_incomplete
+    , LISTAGG(vl.autocoded_unlocked_notes_entry, '\n')  WITHIN GROUP (ORDER BY vl.visit_date, vl.visit_id) AS autocoded_unlocked_notes
+    , LISTAGG(vl.autocoded_locked_notes_entry, '\n')    WITHIN GROUP (ORDER BY vl.visit_date, vl.visit_id) AS autocoded_locked_notes
+
+  FROM visits_labeled vl
+  LEFT JOIN note_timeliness_3m_avg nt
+    ON vl.employee_npi = nt.employee_npi
+  GROUP BY
+      vl.chief_name
+    , vl.chief_email
+    , vl.provider_name
+    , vl.provider_email
+    , nt.avg_pct_closed_in_72h_last_3m
+  HAVING provider_total_notes_cnt > 0
+)
+
+, chief_rollup AS (
+  SELECT
+      chief_name
+    , chief_email
+    , SUM(provider_total_notes_cnt) AS chief_total_notes_cnt
+
+    , LISTAGG(
+        provider_name || ' - Total: ' || provider_total_notes_cnt
+        || CHR(10) || '  • Unlocked Complete: '   || unlocked_notes_complete_cnt
+        || CHR(10) || '  • Unlocked Incomplete: ' || unlocked_notes_incomplete_cnt
+        || CHR(10) || '  • Autocoded Unlocked: '  || autocoded_unlocked_notes_cnt
+        || CHR(10) || '  • Autocoded Locked: '    || autocoded_locked_notes_cnt
+        || CHR(10) || '  • % closed within 72 hours: '
+        || COALESCE(TO_VARCHAR(avg_pct_closed_in_72h_last_3m), 'N/A') || '%'
+      , '\n\n'
+      ) WITHIN GROUP (ORDER BY provider_total_notes_cnt DESC, provider_name) AS providers_and_counts
+
+  FROM provider_rollup
+  GROUP BY 1,2
+)
+
+, chief_with_gm AS (
+  SELECT
+      /* --- GM mapping retained --- */
+      CASE
+        WHEN UPPER(chief_name) LIKE '%CLARK%' OR UPPER(chief_name) LIKE '%TAMORIA%' OR UPPER(chief_name) LIKE '%ST. CLAIR%' OR UPPER(chief_name) LIKE '%STCLAIR%' OR UPPER(chief_name) LIKE '%KOSTOPOULOS%'  THEN 'Kyle'
+        WHEN UPPER(chief_name) LIKE '%MAYOL%' OR UPPER(chief_name) LIKE '%DE PAZ%' OR UPPER(chief_name) LIKE '%MONSOUR%' THEN 'Kimberly'
+        WHEN UPPER(chief_name) LIKE '%WEISS%' OR UPPER(chief_name) LIKE '%POSTERARO%' OR UPPER(chief_name) LIKE '%KHELA%' THEN 'Mia'
+        WHEN UPPER(chief_name) LIKE '%SOUKUP%' OR UPPER(chief_name) LIKE '%MINGLE%' OR UPPER(chief_name) LIKE '%SMITH%' THEN 'Emma'
+        WHEN UPPER(chief_name) LIKE '%FRIX-RHYNE%' OR UPPER(chief_name) LIKE '%DUNCAN%' OR UPPER(chief_name) LIKE '%KEENAN%' OR UPPER(chief_name) LIKE '%FAVRETTO%' OR UPPER(chief_name) LIKE '%EDELSTEIN%' THEN 'Emily'
+        ELSE 'Unmapped'
+      END AS gm_name
+
+    , CASE
+        WHEN UPPER(chief_name) LIKE '%CLARK%' OR UPPER(chief_name) LIKE '%TAMORIA%' OR UPPER(chief_name) LIKE '%ST. CLAIR%' OR UPPER(chief_name) LIKE '%STCLAIR%' OR UPPER(chief_name) LIKE '%KOSTOPOULOS%' THEN 'KYLE.AMES@TALKIATRY.COM'
+        WHEN UPPER(chief_name) LIKE '%MAYOL%' OR UPPER(chief_name) LIKE '%DE PAZ%' OR UPPER(chief_name) LIKE '%MONSOUR%' THEN 'KIMBERLY.GALLAGHER@TALKIATRY.COM'
+        WHEN UPPER(chief_name) LIKE '%WEISS%' OR UPPER(chief_name) LIKE '%POSTERARO%' OR UPPER(chief_name) LIKE '%KHELA%' THEN 'MIA.STECK@TALKIATRY.COM'
+        WHEN UPPER(chief_name) LIKE '%SOUKUP%' OR UPPER(chief_name) LIKE '%MINGLE%' OR UPPER(chief_name) LIKE '%SMITH%' THEN 'EMMA.ANDREWSMCCOY@TALKIATRY.COM'
+        WHEN UPPER(chief_name) LIKE '%FRIX-RHYNE%' OR UPPER(chief_name) LIKE '%DUNCAN%'
+          OR UPPER(chief_name) LIKE '%KEENAN%' OR UPPER(chief_name) LIKE '%FAVRETTO%' OR UPPER(chief_name) LIKE '%EDELSTEIN%'
+          THEN 'EMILY.MAIORANA@TALKIATRY.COM'
+        ELSE NULL
+      END AS gm_email
+
+    , chief_name
+    , chief_email
+    , chief_total_notes_cnt
+    , providers_and_counts
+  FROM chief_rollup
+)
+
+SELECT
+    cwg.gm_name
+  , cwg.gm_email
+  , cwg.chief_name
+  , cwg.chief_email
+  , cwg.chief_total_notes_cnt
+  , cwg.providers_and_counts
+FROM chief_with_gm cwg
+WHERE UPPER(cwg.chief_name) NOT IN (
+          'ALLISON HOLT'
+        , 'ROBERT KRAYN'
+        , 'GEORGIA GAVERAS'
+        , 'DAVID GUGGENHEIM'
+      )
+  AND cwg.chief_total_notes_cnt > 0
+ORDER BY
+    cwg.gm_name
+  , cwg.chief_total_notes_cnt DESC
+  , cwg.chief_name;
+
+
+
+
+----<>---
+
+WITH meagan AS (
+    SELECT
+        employee_npi,
+        employee_full_name,
+        employee_email
+    FROM analytics.common.dim_employees
+    WHERE UPPER(employee_npi) = '1073962650'
+      AND employee_status = 'Active'
+),
+
+recent_visits AS (
+    SELECT
+        fv.visit_id,
+        fv.visit_provider_npi,
+        fv.patient_id                  AS mrn,
+        CAST(fv.visit_date AS DATE)    AS visit_date,
+        fv.visit_status,
+        fv.is_visit_note_locked,
+        fv.visit_note_last_locked_at
+    FROM analytics.common.fct_visits fv
+    WHERE fv.is_visit_billable = 1
+),
+
+locked_since_thursday AS (
+    SELECT
+        rv.visit_id,
+        rv.mrn,
+        rv.visit_date,
+        rv.visit_status,
+        rv.visit_note_last_locked_at
+    FROM recent_visits rv
+    JOIN meagan m
+      ON rv.visit_provider_npi = m.employee_npi
+    WHERE
+    rv.is_visit_note_locked = 1
+    AND rv.visit_note_last_locked_at >= DATEADD('day', -3, CURRENT_DATE)
+)
+
+SELECT
+    m.employee_full_name           AS provider_name,
+    m.employee_email               AS provider_email,
+    COUNT(DISTINCT ls.visit_id)    AS notes_closed_since_thursday,
+    LISTAGG(
+        ls.mrn || ' - ' || TO_CHAR(ls.visit_date, 'YYYY-MM-DD')
+        || ' - Locked At: ' || TO_CHAR(ls.visit_note_last_locked_at, 'YYYY-MM-DD HH24:MI'),
+        '\n'
+    ) WITHIN GROUP (ORDER BY ls.visit_date DESC) AS closed_notes_list
+FROM locked_since_thursday ls
+JOIN meagan m ON TRUE
+GROUP BY 1, 2
+ORDER BY notes_closed_since_thursday DESC;
+
+
+----<>----
+select * from analytics.common.dim_employees
+where employee_full_name ilike 'MEAGAN MAAS';
+
+----<>------
+WITH current_employees AS (
+  -- Active providers with their chief mapping
+  SELECT
+      employee_npi,
+      MAX(employee_full_name)        AS provider_name,
+      MAX(employee_email)            AS provider_email,
+      MAX(employee_supervisor_name)  AS chief_name
+  FROM analytics.common.dim_employees
+  WHERE employee_separation_date IS NULL
+    AND employee_status = 'Active'
+  GROUP BY 1
+),
+
+candidate_visits AS (
+  -- Last 365d, unlocked now, open >3d, billable, and specific visit types (CHK, ARR, LATE CANC, NO SHOW)
+  SELECT DISTINCT
+      fv.visit_id,
+      fv.visit_provider_npi,
+      fv.patient_id                       AS mrn,
+      CAST(fv.visit_date AS DATE)         AS visit_date,
+      fv.visit_status
+  FROM analytics.common.fct_visits fv
+  WHERE
+      CAST(fv.visit_date AS DATE) >= DATEADD('day', -365, CURRENT_DATE)
+      AND CAST(fv.visit_date AS DATE) <= DATEADD('day', -3, CURRENT_DATE)
+      AND COALESCE(fv.is_visit_billable, 0) = 1
+      AND COALESCE(fv.is_visit_note_locked, 0) = 0
+      AND UPPER(COALESCE(fv.visit_status, '')) IN ('CHK','ARR','LATE CANC','NO SHOW')
+),
+
+dedup AS (
+  -- Ensure only one row per visit_id
+  SELECT *
+  FROM (
+    SELECT
+        visit_id, visit_provider_npi, mrn, visit_date, visit_status,
+        ROW_NUMBER() OVER (PARTITION BY visit_id ORDER BY visit_date DESC) AS rn
+    FROM candidate_visits
+  )
+  WHERE rn = 1
+),
+
+coding_flags AS (
+  -- Documentation flags from Candid Coding
+  SELECT
+      cca.encounter_id                                         AS visit_id,
+      MAX(cca.documentation_error)                             AS documentation_error,
+      MAX(
+          CASE
+            WHEN NULLIF(TRIM(cca.documentation_error), '') IS NOT NULL THEN 1
+            ELSE 0
+          END
+      )                                                        AS has_doc_error,
+      MAX(CASE WHEN cca.last_locked_at IS NOT NULL THEN 1 ELSE 0 END) AS was_ever_locked
+  FROM analytics.products.candid_coding_analytics cca
+  WHERE COALESCE(cca.is_visit_billable_and_locked, 1) = 0
+  GROUP BY 1
+)
+
+SELECT
+    ce.chief_name,
+    ce.provider_name,
+    ce.provider_email,
+    d.visit_id,
+    d.mrn,
+    d.visit_date,
+    d.visit_status,
+    COALESCE(cf.was_ever_locked, 0)          AS was_ever_locked,
+    COALESCE(cf.has_doc_error, 0)            AS has_doc_error,
+    COALESCE(NULLIF(TRIM(cf.documentation_error), ''), NULL) AS documentation_error,
+
+    /* Derived classification for easier downstream analysis */
+    CASE
+    WHEN COALESCE(cf.has_doc_error, 0) = 0
+    THEN 'General Unlocked - Completed'
+
+    WHEN COALESCE(cf.has_doc_error, 0) = 1
+     AND COALESCE(cf.was_ever_locked, 0) = 0
+    THEN 'General Unlocked - Incomplete'
+
+    WHEN COALESCE(cf.has_doc_error, 0) = 1
+     AND COALESCE(cf.was_ever_locked, 0) = 1
+    THEN 'Autocoded Unlocked'
+
+    ELSE 'Other'
+END AS unlocked_note_type
+
+
+FROM dedup d
+JOIN current_employees ce
+  ON d.visit_provider_npi = ce.employee_npi
+LEFT JOIN coding_flags cf
+  ON d.visit_id = cf.visit_id
+WHERE UPPER(ce.chief_name) NOT IN (
+    'ALLISON HOLT',
+    'ROBERT KRAYN',
+    'GEORGIA GAVERAS',
+    'DAVID GUGGENHEIM'
+)
+ORDER BY ce.chief_name, ce.provider_name, d.visit_date DESC;
+--------<>--------
+/* ============================================================
+   Unlocked Notes — 4 Metrics in One Query
+   - Metric 1 & 2: EXACTLY your provided logic
+   - Adds Metric 3 (Avg hours to lock) & Metric 4 (Aging buckets snapshot)
+   ============================================================ */
+
+WITH params AS (
+  /* keep your quarterly window for metrics 1–3 */
+  SELECT
+    DATE '2025-01-01' AS start_date,
+    DATE '2025-12-31' AS end_date
+),
+
+/* --- Visit universe (for quarterly metrics 1–3) --- */
+visits_scope AS (
+  SELECT
+    fv.visit_id,
+    fv.patient_id                 AS mrn,
+    fv.visit_provider_npi,
+    fv.visit_status,
+
+    fv.visit_date::TIMESTAMP_NTZ  AS appt_start_ts,
+    DATE_TRUNC('quarter', fv.visit_date)::DATE AS visit_quarter,
+
+    COALESCE(fv.is_visit_billable, 0) AS is_billable,
+
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_first_locked_at)) AS visit_first_locked_ts,
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_last_locked_at))  AS visit_last_locked_ts
+  FROM analytics.common.fct_visits fv
+  WHERE fv.visit_date::DATE BETWEEN (SELECT start_date FROM params)
+                                 AND (SELECT end_date FROM params)
+    AND COALESCE(fv.is_visit_billable, 0) = 1
+    AND UPPER(COALESCE(fv.visit_status, '')) IN ('CHK','ARR','LATE CANC','NO SHOW')
+),
+
+/* --- Candid lock fallback (EXACTLY as in your query) --- */
+candid_lock AS (
+  SELECT
+    cca.encounter_id AS visit_id,
+    MAX(TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(cca.last_locked_at))) AS candid_last_locked_ts
+  FROM analytics.products.candid_coding_analytics cca
+  GROUP BY 1
+),
+
+/* --- Provider credentials -> Psych vs Therapy (EXACTLY as in your query) --- */
+provider_class AS (
+  SELECT
+    p.employee_npi AS provider_npi,
+    CASE
+      WHEN p.provider_type IN ('Doctor','Nurse Practitioner') THEN 'Psych'
+      ELSE 'Therapy'
+    END AS provider_category
+  FROM analytics.common.dim_employees p
+),
+
+/* --- Resolve lock timestamps (EXACTLY as in your query) --- */
+locks_resolved AS (
+  SELECT
+    v.*,
+
+    /* First lock only from visit field */
+    v.visit_first_locked_ts AS first_lock_ts_used,
+
+    /* Last lock with fallback */
+    COALESCE(
+      v.visit_last_locked_ts,
+      cl.candid_last_locked_ts
+    ) AS last_lock_ts_used,
+
+    /* Any lock (proxy for "has a note") */
+    COALESCE(
+      v.visit_first_locked_ts,
+      v.visit_last_locked_ts,
+      cl.candid_last_locked_ts
+    ) AS any_lock_ts_used
+  FROM visits_scope v
+  LEFT JOIN candid_lock cl
+    ON cl.visit_id = v.visit_id
+),
+
+/* --- Denominator for Metric 1: include notes even if first lock missing (EXACT) --- */
+denom AS (
+  SELECT
+    lr.*,
+    pc.provider_category
+  FROM locks_resolved lr
+  LEFT JOIN provider_class pc
+    ON pc.provider_npi = lr.visit_provider_npi
+  WHERE any_lock_ts_used IS NOT NULL
+),
+
+/* --- Calc (EXACT for metrics 1 & 2, plus adds hours_to_lock for metric 3) --- */
+calc AS (
+  SELECT
+    visit_id,
+    mrn,
+    visit_provider_npi,
+    COALESCE(provider_category, 'Therapy') AS provider_category,
+    visit_status,
+    visit_quarter,
+    appt_start_ts,
+    first_lock_ts_used,
+    last_lock_ts_used,
+
+    /* Metric 1 flag: only computable if first lock exists */
+    CASE
+      WHEN first_lock_ts_used IS NOT NULL
+       AND DATEDIFF(
+             'minute',
+             appt_start_ts,
+             GREATEST(appt_start_ts, first_lock_ts_used)
+           ) <= 72 * 60
+      THEN 1 ELSE 0
+    END AS first_locked_within_72h_flag,
+
+    /* Metric 2: Reopened flag only makes sense if first + last exist */
+    CASE
+      WHEN first_lock_ts_used IS NOT NULL
+       AND last_lock_ts_used  IS NOT NULL
+       AND last_lock_ts_used > first_lock_ts_used
+      THEN 1 ELSE 0
+    END AS reopened_flag,
+
+    /* Metric 3 helper: hours from appt -> last lock (with safety guard) */
+    CASE
+      WHEN last_lock_ts_used IS NOT NULL THEN
+        DATEDIFF(
+          'minute',
+          appt_start_ts,
+          GREATEST(appt_start_ts, last_lock_ts_used)
+        ) / 60.0
+      ELSE NULL
+    END AS hours_to_lock
+
+  FROM denom
+),
+
+/* ============================================================
+   Metric 4: Aging buckets snapshot (never locked + >72h)
+   Note: This is independent of the quarterly window and uses 365d lookback
+   ============================================================ */
+aging_visits AS (
+  SELECT
+    fv.visit_id,
+    fv.visit_provider_npi,
+    fv.visit_date::TIMESTAMP_NTZ AS appt_start_ts,
+
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_first_locked_at)) AS visit_first_locked_ts,
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_last_locked_at))  AS visit_last_locked_ts
+  FROM analytics.common.fct_visits fv
+  WHERE fv.visit_date::DATE BETWEEN DATEADD('day', -365, CURRENT_DATE()) AND CURRENT_DATE()
+    AND COALESCE(fv.is_visit_billable, 0) = 1
+    AND UPPER(COALESCE(fv.visit_status, '')) IN ('CHK','ARR','LATE CANC','NO SHOW')
+),
+
+aging_locks_resolved AS (
+  SELECT
+    av.*,
+    COALESCE(av.visit_first_locked_ts, av.visit_last_locked_ts, cl.candid_last_locked_ts) AS any_lock_ts_used
+  FROM aging_visits av
+  LEFT JOIN candid_lock cl
+    ON cl.visit_id = av.visit_id
+),
+
+aging_calc AS (
+  SELECT
+    alr.visit_id,
+    COALESCE(pc.provider_category, 'Therapy') AS provider_category,
+    DATEDIFF('hour', alr.appt_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) AS hours_since_appt,
+    CASE
+      WHEN DATEDIFF('hour', alr.appt_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) > 72
+       AND DATEDIFF('hour', alr.appt_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) <= 96
+      THEN '72-96h'
+      WHEN DATEDIFF('hour', alr.appt_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) > 96
+       AND DATEDIFF('hour', alr.appt_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) <= 120
+      THEN '96-120h'
+      WHEN DATEDIFF('hour', alr.appt_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) > 120
+      THEN '120h+'
+      ELSE NULL
+    END AS aging_bucket
+  FROM aging_locks_resolved alr
+  LEFT JOIN provider_class pc
+    ON pc.provider_npi = alr.visit_provider_npi
+  WHERE alr.any_lock_ts_used IS NULL
+    AND DATEDIFF('hour', alr.appt_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) > 72
+)
+
+/* ============================================================
+   FINAL OUTPUT (one table)
+   ============================================================ */
+SELECT
+  'Notes Locked in 72 Hours (%)' AS metric_name,
+  'quarter' AS period_type,
+  visit_quarter AS period_start,
+  CONCAT(YEAR(visit_quarter), '-Q', QUARTER(visit_quarter)) AS period_label,
+  provider_category,
+  NULL AS aging_bucket,
+  COUNT(DISTINCT visit_id) AS denom,
+  COUNT(DISTINCT CASE WHEN first_locked_within_72h_flag = 1 THEN visit_id END) AS num,
+  ROUND(
+    COUNT(DISTINCT CASE WHEN first_locked_within_72h_flag = 1 THEN visit_id END)::FLOAT
+    / NULLIF(COUNT(DISTINCT visit_id), 0),
+    4
+  ) AS value
+FROM calc
+GROUP BY 1,2,3,4,5,6
+
+UNION ALL
+
+SELECT
+  'Notes Reopened After Locked in 72 Hours (%)' AS metric_name,
+  'quarter' AS period_type,
+  visit_quarter AS period_start,
+  CONCAT(YEAR(visit_quarter), '-Q', QUARTER(visit_quarter)) AS period_label,
+  provider_category,
+  NULL AS aging_bucket,
+  COUNT(DISTINCT CASE WHEN first_locked_within_72h_flag = 1 THEN visit_id END) AS denom,
+  COUNT(DISTINCT CASE WHEN first_locked_within_72h_flag = 1 AND reopened_flag = 1 THEN visit_id END) AS num,
+  ROUND(
+    COUNT(DISTINCT CASE WHEN first_locked_within_72h_flag = 1 AND reopened_flag = 1 THEN visit_id END)::FLOAT
+    / NULLIF(COUNT(DISTINCT CASE WHEN first_locked_within_72h_flag = 1 THEN visit_id END), 0),
+    4
+  ) AS value
+FROM calc
+GROUP BY 1,2,3,4,5,6
+
+UNION ALL
+
+SELECT
+  'Average Time to Lock Notes (Hours)' AS metric_name,
+  'quarter' AS period_type,
+  visit_quarter AS period_start,
+  CONCAT(YEAR(visit_quarter), '-Q', QUARTER(visit_quarter)) AS period_label,
+  provider_category,
+  NULL AS aging_bucket,
+  COUNT(DISTINCT visit_id) AS denom,
+  COUNT(DISTINCT CASE WHEN hours_to_lock IS NOT NULL THEN visit_id END) AS num,
+  ROUND(AVG(hours_to_lock), 2) AS value
+FROM calc
+WHERE hours_to_lock IS NOT NULL
+GROUP BY 1,2,3,4,5,6
+
+UNION ALL
+
+SELECT
+  'Locking Notes Aging Buckets (Count)' AS metric_name,
+  'snapshot' AS period_type,
+  CURRENT_DATE() AS period_start,
+  TO_VARCHAR(CURRENT_DATE()) AS period_label,
+  provider_category,
+  aging_bucket,
+  NULL AS denom,
+  COUNT(DISTINCT visit_id) AS num,
+  COUNT(DISTINCT visit_id)::FLOAT AS value
+FROM aging_calc
+WHERE aging_bucket IS NOT NULL
+GROUP BY 1,2,3,4,5,6
+
+ORDER BY
+  period_type,
+  period_start,
+  provider_category,
+  metric_name,
+  CASE aging_bucket
+    WHEN '72-96h' THEN 1
+    WHEN '96-120h' THEN 2
+    WHEN '120h+' THEN 3
+    ELSE 99
+  END;
+---------<>---------
+/* ============================================================
+   Time-to-First-Lock Buckets (%) — Quarterly (2025)
+   Buckets: <72h, 72-96h, 96-120h, 120h+
+   Uses FIRST LOCK timestamp (same basis as your Metric 1)
+   ============================================================ */
+
+WITH params AS (
+  SELECT
+    DATE '2025-01-01' AS start_date,
+    DATE '2025-12-31' AS end_date
+),
+
+/* --- Visit universe --- */
+visits_scope AS (
+  SELECT
+    fv.visit_id,
+    fv.patient_id                 AS mrn,
+    fv.visit_provider_npi,
+    fv.visit_status,
+
+    fv.visit_date::TIMESTAMP_NTZ  AS appt_start_ts,
+    DATE_TRUNC('quarter', fv.visit_date)::DATE AS visit_quarter,
+
+    COALESCE(fv.is_visit_billable, 0) AS is_billable,
+
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_first_locked_at)) AS visit_first_locked_ts,
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_last_locked_at))  AS visit_last_locked_ts
+  FROM analytics.common.fct_visits fv
+  WHERE fv.visit_date::DATE BETWEEN (SELECT start_date FROM params)
+                                 AND (SELECT end_date FROM params)
+    AND COALESCE(fv.is_visit_billable, 0) = 1
+    AND UPPER(COALESCE(fv.visit_status, '')) IN ('CHK','ARR','LATE CANC','NO SHOW')
+),
+
+/* --- Candid lock fallback (kept for consistency / denominator alignment) --- */
+candid_lock AS (
+  SELECT
+    cca.encounter_id AS visit_id,
+    MAX(TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(cca.last_locked_at))) AS candid_last_locked_ts
+  FROM analytics.products.candid_coding_analytics cca
+  GROUP BY 1
+),
+
+/* --- Provider credentials -> Psych vs Therapy --- */
+provider_class AS (
+  SELECT
+    p.employee_npi AS provider_npi,
+    CASE
+      WHEN p.provider_type IN ('Doctor','Nurse Practitioner') THEN 'Psych'
+      ELSE 'Therapy'
+    END AS provider_category
+  FROM analytics.common.dim_employees p
+),
+
+/* --- Resolve lock timestamps (same as your original pattern) --- */
+locks_resolved AS (
+  SELECT
+    v.*,
+    v.visit_first_locked_ts AS first_lock_ts_used,
+    COALESCE(v.visit_last_locked_ts, cl.candid_last_locked_ts) AS last_lock_ts_used,
+    COALESCE(v.visit_first_locked_ts, v.visit_last_locked_ts, cl.candid_last_locked_ts) AS any_lock_ts_used
+  FROM visits_scope v
+  LEFT JOIN candid_lock cl
+    ON cl.visit_id = v.visit_id
+),
+
+/* --- Denominator: visits that have any lock evidence --- */
+denom AS (
+  SELECT
+    lr.*,
+    COALESCE(pc.provider_category, 'Therapy') AS provider_category
+  FROM locks_resolved lr
+  LEFT JOIN provider_class pc
+    ON pc.provider_npi = lr.visit_provider_npi
+  WHERE any_lock_ts_used IS NOT NULL
+),
+
+calc AS (
+  SELECT
+    visit_id,
+    visit_quarter,
+    provider_category,
+
+    appt_start_ts,
+    first_lock_ts_used,
+
+    /* Minutes to first lock (guard against bad negative timestamps) */
+    CASE
+      WHEN first_lock_ts_used IS NOT NULL THEN
+        DATEDIFF(
+          'minute',
+          appt_start_ts,
+          GREATEST(appt_start_ts, first_lock_ts_used)
+        )
+      ELSE NULL
+    END AS mins_to_first_lock
+  FROM denom
+)
+
+SELECT
+  visit_quarter AS quarter_start,
+  CONCAT(YEAR(visit_quarter), '-Q', QUARTER(visit_quarter)) AS quarter,
+  provider_category,
+
+  COUNT(DISTINCT visit_id) AS denom_visits_with_any_lock,
+
+  /* counts */
+  COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock <  72*60 THEN visit_id END) AS n_lt_72h,
+  COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock >= 72*60 AND mins_to_first_lock <  96*60 THEN visit_id END) AS n_72_96h,
+  COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock >= 96*60 AND mins_to_first_lock < 120*60 THEN visit_id END) AS n_96_120h,
+  COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock >= 120*60 THEN visit_id END) AS n_120h_plus,
+
+  /* percents (of visits with a computable first lock timestamp) */
+  COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL THEN visit_id END) AS denom_visits_with_first_lock,
+
+  ROUND(
+    COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock < 72*60 THEN visit_id END)::FLOAT
+    / NULLIF(COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL THEN visit_id END), 0),
+    4
+  ) AS pct_lt_72h,
+
+  ROUND(
+    COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock >= 72*60 AND mins_to_first_lock < 96*60 THEN visit_id END)::FLOAT
+    / NULLIF(COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL THEN visit_id END), 0),
+    4
+  ) AS pct_72_96h,
+
+  ROUND(
+    COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock >= 96*60 AND mins_to_first_lock < 120*60 THEN visit_id END)::FLOAT
+    / NULLIF(COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL THEN visit_id END), 0),
+    4
+  ) AS pct_96_120h,
+
+  ROUND(
+    COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL AND mins_to_first_lock >= 120*60 THEN visit_id END)::FLOAT
+    / NULLIF(COUNT(DISTINCT CASE WHEN mins_to_first_lock IS NOT NULL THEN visit_id END), 0),
+    4
+  ) AS pct_120h_plus
+
+FROM calc
+GROUP BY 1,2,3
+ORDER BY 1,3;
+------<>------
+WITH params AS (
+  SELECT DATE '2026-01-01' AS start_date, DATE '2026-2-28' AS end_date
+),
+
+visits_scope AS (
+  SELECT
+    fv.visit_id,
+    fv.visit_provider_npi,
+    fv.visit_date::TIMESTAMP_NTZ AS appt_start_ts,
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_first_locked_at)) AS visit_first_locked_ts,
+    TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(fv.visit_note_last_locked_at))  AS visit_last_locked_ts
+  FROM analytics.common.fct_visits fv
+  WHERE fv.visit_date::DATE BETWEEN (SELECT start_date FROM params)
+                                 AND (SELECT end_date FROM params)
+    AND COALESCE(fv.is_visit_billable, 0) = 1
+    AND UPPER(COALESCE(fv.visit_status, '')) IN ('CHK','ARR','LATE CANC','NO SHOW')
+),
+
+candid_lock AS (
+  SELECT
+    cca.encounter_id AS visit_id,
+    MAX(TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR(cca.last_locked_at))) AS candid_last_locked_ts
+  FROM analytics.products.candid_coding_analytics cca
+  GROUP BY 1
+),
+
+provider_class AS (
+  SELECT
+    p.employee_npi AS provider_npi,
+    CASE
+      WHEN p.provider_type IN ('Doctor','Nurse Practitioner') THEN 'Psych'
+      ELSE 'Therapy'
+    END AS provider_category
+  FROM analytics.common.dim_employees p
+),
+
+locks_resolved AS (
+  SELECT
+    v.*,
+    v.visit_first_locked_ts AS first_lock_ts_used,
+    COALESCE(v.visit_last_locked_ts, cl.candid_last_locked_ts) AS last_lock_ts_used,
+    COALESCE(v.visit_first_locked_ts, v.visit_last_locked_ts, cl.candid_last_locked_ts) AS any_lock_ts_used
+  FROM visits_scope v
+  LEFT JOIN candid_lock cl
+    ON cl.visit_id = v.visit_id
+),
+
+denom AS (
+  SELECT
+    lr.*,
+    COALESCE(pc.provider_category, 'Therapy') AS provider_category
+  FROM locks_resolved lr
+  LEFT JOIN provider_class pc
+    ON pc.provider_npi = lr.visit_provider_npi
+  WHERE any_lock_ts_used IS NOT NULL
+),
+
+calc AS (
+  SELECT
+    provider_category,
+    CASE
+      WHEN first_lock_ts_used IS NOT NULL THEN
+        DATEDIFF(
+          'minute',
+          appt_start_ts,
+          GREATEST(appt_start_ts, first_lock_ts_used)
+        )
+      ELSE NULL
+    END AS mins_to_first_lock
+  FROM denom
+)
+
+SELECT
+  provider_category,
+  COUNT(*) AS visits_with_any_lock,                                 -- "all notes" per your current denom
+  COUNT(CASE WHEN mins_to_first_lock IS NOT NULL THEN 1 END) AS visits_with_first_lock,
+  AVG(mins_to_first_lock) AS avg_mins_to_first_lock,
+  MEDIAN(mins_to_first_lock) AS median_mins_to_first_lock
+FROM calc
+GROUP BY 1
+ORDER BY 1;
