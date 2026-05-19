@@ -1,0 +1,85 @@
+WITH visits AS (
+  SELECT
+      fv.visit_id
+    , CASE
+        WHEN cca.provider_category_functional = 'Psychiatrist'
+          OR cca.is_psychiatry_visit = 1
+          THEN 'Psych'
+        WHEN cca.provider_category_functional = 'Therapist'
+          OR cca.is_psychiatry_visit = 0
+          THEN 'Therapy'
+        ELSE 'Unknown'
+      END AS provider_group
+    , CAST(fv.visit_date AS TIMESTAMP) AS visit_ts
+    , DATE_TRUNC('quarter', CAST(fv.visit_date AS DATE)) AS quarter_start
+    , cca.last_locked_at
+  FROM analytics.common.fct_visits fv
+  LEFT JOIN analytics.products.candid_coding_analytics cca
+    ON fv.visit_id = cca.encounter_id
+  WHERE COALESCE(fv.is_visit_billable, 0) = 1
+    AND CAST(fv.visit_date AS DATE) >= '2025-01-01'
+    AND CAST(fv.visit_date AS DATE) < '2027-01-01'
+),
+
+quarterly_agg AS (
+  SELECT
+      provider_group
+    , quarter_start
+    , COUNT(DISTINCT visit_id) AS total_visits
+    , COUNT_IF(
+        last_locked_at IS NOT NULL
+        AND last_locked_at <= DATEADD('hour', 72, visit_ts)
+      ) AS closed_within_72_count
+  FROM visits
+  WHERE provider_group IN ('Psych', 'Therapy')
+  GROUP BY 1,2
+),
+
+quarterly_with_pct AS (
+  SELECT
+      provider_group
+    , quarter_start
+    , CASE
+        WHEN quarter_start = '2025-01-01' THEN '2025 Q1'
+        WHEN quarter_start = '2025-04-01' THEN '2025 Q2'
+        WHEN quarter_start = '2025-07-01' THEN '2025 Q3'
+        WHEN quarter_start = '2025-10-01' THEN '2025 Q4'
+        WHEN quarter_start = '2026-01-01' THEN '2026 Q1'
+        WHEN quarter_start = '2026-04-01' THEN '2026 Q2'
+        WHEN quarter_start = '2026-07-01' THEN '2026 Q3'
+        WHEN quarter_start = '2026-10-01' THEN '2026 Q4'
+      END AS quarter
+    , total_visits
+    , closed_within_72_count
+    , ROUND(
+        closed_within_72_count / NULLIF(total_visits, 0)
+      , 4) AS pct_closed_within_72
+  FROM quarterly_agg
+),
+
+quarterly_with_prev AS (
+  SELECT
+      *
+    , LAG(pct_closed_within_72) OVER (
+        PARTITION BY provider_group
+        ORDER BY quarter_start
+      ) AS pct_prev_quarter
+  FROM quarterly_with_pct
+)
+
+SELECT
+    provider_group
+  , quarter
+  , total_visits
+  , closed_within_72_count
+  , pct_closed_within_72
+  , pct_prev_quarter
+  , ROUND(
+        pct_closed_within_72 - pct_prev_quarter
+      , 4
+    ) AS pct_qoq_change_pctpts
+FROM quarterly_with_prev
+WHERE quarter IS NOT NULL
+ORDER BY
+    provider_group
+  , quarter_start;
