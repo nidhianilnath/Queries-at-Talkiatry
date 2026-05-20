@@ -1,0 +1,20 @@
+SELECT
+    p.provider_id,
+    p.provider_npi,
+    s.provider_start_date,
+    DATE_TRUNC('week', s.provider_start_date) AS start_week,
+    COALESCE(SUM(s.schedule_minutes) / 60.0, 0) AS total_scheduled_hours_start_week,
+    CASE WHEN COALESCE(SUM(s.schedule_minutes),0) > 0 THEN TRUE ELSE FALSE END AS has_scheduled_minutes_in_start_week,
+    -- pull primary state from the prep table (same value for each daily row in the week)
+    MAX(s.provider_primary_practice_state) AS provider_primary_practice_state
+FROM analytics.staging.stg_ecw_providers AS p
+LEFT JOIN analytics.prep.prep_provider_daily_schedule_optimization AS s
+    ON p.provider_id = s.provider_id
+    -- keep only rows that fall in the same week as the provider_start_date
+    AND DATE_TRUNC('week', s.date_date) = DATE_TRUNC('week', s.provider_start_date)
+GROUP BY
+    p.provider_id,
+    p.provider_npi,
+    s.provider_start_date
+ORDER BY
+    s.provider_start_date
