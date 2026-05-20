@@ -1,0 +1,784 @@
+/* ===== PMHNP Full Query (NP-only states: Active NP or NP app in progress) ===== */
+WITH market_states AS (
+    SELECT
+        provider_practice_location_provider_id AS provider_id,
+        COALESCE(LISTAGG(provider_practice_location_state, ', '), ', ') AS market_states
+    FROM analytics.staging.STG_VERIFIABLE_PROVIDER_PRACTICE_LOCATION
+    GROUP BY 1
+),
+
+/* Presence-based market ON per provider+state */
+open_markets AS (
+  SELECT
+    provider_practice_location_provider_id AS provider_id,
+    UPPER(TRIM(provider_practice_location_state)) AS state,
+    'Yes' AS market_on
+  FROM analytics.staging.STG_VERIFIABLE_PROVIDER_PRACTICE_LOCATION
+  WHERE provider_practice_location_state IS NOT NULL
+  GROUP BY 1,2
+),
+
+provider AS (
+    SELECT
+        c.contact_id AS provider_id,
+        c.contact_name AS provider_name,
+        c.contact_talkiatry_provider_type AS provider_type,
+        c.contact_npi_number AS provider_npi,
+        CAST(c.contact_start_date AS DATE) AS start_date,
+        CAST(c.contact_created_at AS DATE) AS sign_date,
+        ms.market_states
+    FROM analytics.staging.stg_verifiable_contact c
+    LEFT JOIN market_states ms ON ms.provider_id = c.contact_id
+    WHERE c.contact_name NOT IN ('VF LA Test', 'AdelineTest LeyTest')
+      AND c.contact_provider_status NOT IN ('Terminated', 'Withdrew')
+),
+
+/* CSR states list (for CSR-M rule) */
+csr_states AS (
+  SELECT 'AL' s UNION ALL SELECT 'CT' UNION ALL SELECT 'DE' UNION ALL SELECT 'DC' UNION ALL SELECT 'GU'
+  UNION ALL SELECT 'HI' UNION ALL SELECT 'ID' UNION ALL SELECT 'IL' UNION ALL SELECT 'IN' UNION ALL SELECT 'IA'
+  UNION ALL SELECT 'LA' UNION ALL SELECT 'MA' UNION ALL SELECT 'MD' UNION ALL SELECT 'MI' UNION ALL SELECT 'MO'
+  UNION ALL SELECT 'NV' UNION ALL SELECT 'NJ' UNION ALL SELECT 'NM' UNION ALL SELECT 'OK' UNION ALL SELECT 'PR'
+  UNION ALL SELECT 'RI' UNION ALL SELECT 'SC' UNION ALL SELECT 'SD' UNION ALL SELECT 'UT' UNION ALL SELECT 'WY'
+),
+
+/* APRN compact map (for PMHNP display) */
+compact_map AS (
+  SELECT 'AL' s UNION ALL SELECT 'AZ' UNION ALL SELECT 'AR' UNION ALL SELECT 'CO' UNION ALL SELECT 'CT'
+  UNION ALL SELECT 'DE' UNION ALL SELECT 'FL' UNION ALL SELECT 'GA' UNION ALL SELECT 'GU' UNION ALL SELECT 'ID'
+  UNION ALL SELECT 'IN' UNION ALL SELECT 'IA' UNION ALL SELECT 'KS' UNION ALL SELECT 'KY' UNION ALL SELECT 'LA'
+  UNION ALL SELECT 'ME' UNION ALL SELECT 'MD' UNION ALL SELECT 'MA' UNION ALL SELECT 'MS' UNION ALL SELECT 'MO'
+  UNION ALL SELECT 'MT' UNION ALL SELECT 'NE' UNION ALL SELECT 'NH' UNION ALL SELECT 'NJ' UNION ALL SELECT 'NM'
+  UNION ALL SELECT 'NC' UNION ALL SELECT 'ND' UNION ALL SELECT 'OH' UNION ALL SELECT 'OK' UNION ALL SELECT 'PA'
+  UNION ALL SELECT 'RI' UNION ALL SELECT 'SC' UNION ALL SELECT 'SD' UNION ALL SELECT 'TN' UNION ALL SELECT 'TX'
+  UNION ALL SELECT 'UT' UNION ALL SELECT 'VT' UNION ALL SELECT 'VA' UNION ALL SELECT 'VI' UNION ALL SELECT 'WA'
+  UNION ALL SELECT 'WV' UNION ALL SELECT 'WI'
+),
+
+/* RN CSR list used in RN/RN-C/RN-Via C logic (includes WY) */
+rn_csr_list AS (
+  SELECT 'AL' s UNION ALL SELECT 'AZ' UNION ALL SELECT 'AR' UNION ALL SELECT 'CO' UNION ALL SELECT 'CT'
+  UNION ALL SELECT 'DE' UNION ALL SELECT 'FL' UNION ALL SELECT 'GA' UNION ALL SELECT 'GU' UNION ALL SELECT 'ID'
+  UNION ALL SELECT 'IN' UNION ALL SELECT 'IA' UNION ALL SELECT 'KS' UNION ALL SELECT 'KY' UNION ALL SELECT 'LA'
+  UNION ALL SELECT 'ME' UNION ALL SELECT 'MD' UNION ALL SELECT 'MA' UNION ALL SELECT 'MS' UNION ALL SELECT 'MO'
+  UNION ALL SELECT 'MT' UNION ALL SELECT 'NE' UNION ALL SELECT 'NH' UNION ALL SELECT 'NJ' UNION ALL SELECT 'NM'
+  UNION ALL SELECT 'NC' UNION ALL SELECT 'ND' UNION ALL SELECT 'OH' UNION ALL SELECT 'OK' UNION ALL SELECT 'PA'
+  UNION ALL SELECT 'RI' UNION ALL SELECT 'SC' UNION ALL SELECT 'SD' UNION ALL SELECT 'TN' UNION ALL SELECT 'TX'
+  UNION ALL SELECT 'UT' UNION ALL SELECT 'VT' UNION ALL SELECT 'VA' UNION ALL SELECT 'VI' UNION ALL SELECT 'WA'
+  UNION ALL SELECT 'WV' UNION ALL SELECT 'WI' UNION ALL SELECT 'WY'
+),
+
+/* ===== ACTIVE SIDE: include ALL rows but compute NP priority for filtering later ===== */
+license_data AS (
+    SELECT
+        p.provider_id,
+        p.provider_name,
+        p.provider_type,
+        p.provider_npi,
+        p.start_date,
+        p.sign_date,
+        l.license_jurisdiction_state AS state,
+
+        CASE 
+          WHEN p.provider_type = 'PMHNP' AND EXISTS (SELECT 1 FROM compact_map cm WHERE cm.s = l.license_jurisdiction_state) THEN 'Compact'
+          WHEN p.provider_type = 'PMHNP' THEN 'N/A'
+          ELSE '' 
+        END AS compact_status,
+
+        /* DEA priority */
+        MAX(
+          CASE
+            WHEN p.provider_type NOT IN ('MD','DO','PMHNP') THEN 0
+            WHEN EXISTS (
+              SELECT 1
+              FROM analytics.staging.stg_verifiable_dea_number d1
+              WHERE d1.dea_number_provider_id = l.license_provider_id
+                AND UPPER(TRIM(d1.dea_number_state)) = UPPER(TRIM(l.license_jurisdiction_state))
+                AND d1.is_dea_number_active = 'TRUE'
+                AND UPPER(COALESCE(d1.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+            ) THEN 4
+            WHEN UPPER(TRIM(l.license_jurisdiction_state)) IN ('GA','CA')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM analytics.staging.stg_verifiable_dea_number a
+                WHERE a.dea_number_provider_id = l.license_provider_id
+                  AND UPPER(TRIM(a.dea_number_state)) = UPPER(TRIM(l.license_jurisdiction_state))
+                  AND a.is_dea_number_active = 'TRUE'
+                  AND UPPER(COALESCE(a.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM analytics.staging.stg_verifiable_dea_number i
+                WHERE i.dea_number_provider_id = l.license_provider_id
+                  AND UPPER(TRIM(i.dea_number_state)) = UPPER(TRIM(l.license_jurisdiction_state))
+                  AND i.is_dea_number_active = 'FALSE'
+              ) THEN 3
+            WHEN UPPER(TRIM(l.license_jurisdiction_state)) IN ('GA','CA')
+              AND EXISTS (
+                SELECT 1
+                FROM analytics.staging.stg_verifiable_dea_number i2
+                WHERE i2.dea_number_provider_id = l.license_provider_id
+                  AND UPPER(TRIM(i2.dea_number_state)) = UPPER(TRIM(l.license_jurisdiction_state))
+                  AND i2.is_dea_number_active = 'FALSE'
+              ) THEN 1
+            WHEN UPPER(TRIM(l.license_jurisdiction_state)) NOT IN ('GA','CA')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM analytics.staging.stg_verifiable_dea_number cs
+                WHERE cs.dea_number_provider_id = l.license_provider_id
+                  AND UPPER(TRIM(cs.dea_number_state)) = UPPER(TRIM(l.license_jurisdiction_state))
+                  AND cs.is_dea_number_active = 'TRUE'
+                  AND UPPER(COALESCE(cs.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM analytics.staging.stg_verifiable_dea_number os
+                WHERE os.dea_number_provider_id = l.license_provider_id
+                  AND os.is_dea_number_active = 'TRUE'
+                  AND UPPER(COALESCE(os.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+                  AND UPPER(TRIM(os.dea_number_state)) <> UPPER(TRIM(l.license_jurisdiction_state))
+              ) THEN 2
+            WHEN NOT EXISTS (
+              SELECT 1
+              FROM analytics.staging.stg_verifiable_dea_number na
+              WHERE na.dea_number_provider_id = l.license_provider_id
+                AND na.is_dea_number_active = 'TRUE'
+                AND UPPER(COALESCE(na.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+            ) THEN 3
+            WHEN EXISTS (
+              SELECT 1
+              FROM analytics.staging.stg_verifiable_dea_number ix
+              WHERE ix.dea_number_provider_id = l.license_provider_id
+                AND UPPER(TRIM(ix.dea_number_state)) = UPPER(TRIM(l.license_jurisdiction_state))
+                AND ix.is_dea_number_active = 'FALSE'
+            ) THEN 1
+            ELSE 0
+          END
+        ) AS dea_priority,
+
+        /* CSR priority */
+        MAX(
+          CASE
+            WHEN p.provider_type NOT IN ('MD','DO','PMHNP') THEN 0
+            WHEN l.license_type_abbreviation = 'CSR' 
+                 AND l.license_talkiatry_status = 'Active' THEN 3
+            WHEN l.license_type_abbreviation = 'CSR' 
+                 AND l.license_talkiatry_status = 'Inactive' THEN 2
+            WHEN EXISTS (SELECT 1 FROM csr_states cs WHERE cs.s = l.license_jurisdiction_state)
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM analytics.staging.stg_verifiable_licenses sub
+                   WHERE sub.license_provider_id = l.license_provider_id
+                     AND sub.license_jurisdiction_state = l.license_jurisdiction_state
+                     AND sub.license_type_abbreviation = 'CSR'
+                     AND sub.license_talkiatry_status = 'Active'
+                 ) THEN 1
+            ELSE 0
+          END
+        ) AS csr_priority,
+
+        /* RN priority (for RN status) */
+        MAX(
+          CASE
+            WHEN l.license_talkiatry_status = 'Active'
+             AND l.license_type_abbreviation = 'RN'
+             AND NOT EXISTS (SELECT 1 FROM rn_csr_list rcs WHERE rcs.s = l.license_jurisdiction_state)
+            THEN 4
+            WHEN l.license_talkiatry_status = 'Active'
+             AND l.license_type_abbreviation = 'RN'
+             AND EXISTS (SELECT 1 FROM rn_csr_list rcs WHERE rcs.s = l.license_jurisdiction_state)
+            THEN 3
+            WHEN l.license_talkiatry_status = 'Inactive'
+             AND l.license_type_abbreviation = 'RN'
+            THEN 1
+            WHEN p.provider_type IN ('NP','PMHNP')
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM analytics.staging.stg_verifiable_licenses rn_check
+                 WHERE rn_check.license_provider_id = l.license_provider_id
+                   AND rn_check.license_jurisdiction_state = l.license_jurisdiction_state
+                   AND rn_check.license_type_abbreviation = 'RN'
+                   AND rn_check.license_talkiatry_status = 'Active'
+             )
+             AND EXISTS (
+                 SELECT 1
+                 FROM analytics.staging.stg_verifiable_licenses compact_rn
+                 WHERE compact_rn.license_provider_id = l.license_provider_id
+                   AND compact_rn.license_type_abbreviation = 'RN'
+                   AND compact_rn.license_talkiatry_status = 'Active'
+                   AND EXISTS (SELECT 1 FROM rn_csr_list rcs WHERE rcs.s = compact_rn.license_jurisdiction_state)
+             )
+             AND EXISTS (SELECT 1 FROM rn_csr_list rcs WHERE rcs.s = l.license_jurisdiction_state)
+            THEN 2
+            ELSE 0
+          END
+        ) AS rn_priority,
+
+        /* NP/PMHNP priority — we will filter to only =2 (Active NP) in the Active branch */
+        MAX(
+            CASE
+                WHEN l.license_talkiatry_status = 'Active' 
+                     AND l.license_type_abbreviation IN ('NP','PMHNP') 
+                     AND COALESCE(UPPER(l.license_specification),'') NOT IN ('LIMITED','TRAINING','TEMPORARY')
+                THEN 2
+                WHEN l.license_talkiatry_status = 'Inactive' 
+                     AND l.license_type_abbreviation IN ('NP','PMHNP')
+                     AND COALESCE(UPPER(l.license_specification),'') NOT IN ('LIMITED','TRAINING','TEMPORARY')
+                THEN 1
+                ELSE 0
+            END
+        ) AS np_priority,
+
+        /* MD/DO bucket (unused for PMHNP completeness rules but retained) */
+        MAX(
+            CASE
+                WHEN l.license_talkiatry_status = 'Active' 
+                     AND l.license_type_abbreviation NOT IN ('NP','PMHNP') THEN 2
+                WHEN l.license_talkiatry_status = 'Inactive' 
+                     AND l.license_type_abbreviation NOT IN ('NP','PMHNP') THEN 1
+                ELSE 0
+            END
+        ) AS md_priority,
+
+        /* RX Auth (for NP/PMHNP) */
+        MAX(
+            CASE
+                WHEN l.license_type_abbreviation IN ('NP','PMHNP')
+                     AND l.license_specification = 'Prescriptive Authority'
+                     AND l.license_talkiatry_status = 'Active' THEN 'RX'
+                WHEN l.license_type_abbreviation IN ('NP','PMHNP')
+                     AND l.license_specification = 'Prescriptive Authority'
+                     AND l.license_talkiatry_status = 'Inactive' THEN 'RX-X'
+                ELSE ''
+            END
+        ) AS rx_authorization_status,
+
+        /* NP Autonomy Privilege per provider/state */
+        MAX(
+          CASE
+            WHEN UPPER(TRIM(l.license_type_abbreviation)) IN ('NP','PMHNP')
+                 AND COALESCE(UPPER(l.license_specification),'') NOT IN ('LIMITED','TRAINING','TEMPORARY')
+            THEN l.is_license_autonomy_privilege
+            ELSE NULL
+          END
+        ) AS np_autonomy_privilege,
+
+        p.market_states,
+        MAX(l.license_created_at) AS created_at
+    FROM provider p
+    LEFT JOIN analytics.staging.stg_verifiable_licenses l 
+      ON p.provider_id = l.license_provider_id
+     AND l.license_jurisdiction_state IS NOT NULL
+     AND (
+           (p.provider_type = 'PMHNP')
+        OR (p.provider_type IN ('MD','DO') AND UPPER(COALESCE(l.license_type_abbreviation,'')) NOT IN ('RN','CSR','NP','PMHNP'))
+        OR (p.provider_type NOT IN ('MD','DO','PMHNP'))
+         )
+    GROUP BY 1,2,3,4,5,6,7,p.market_states
+),
+
+classified AS (
+    SELECT
+        ld.*,
+        CASE 
+            WHEN ld.provider_type IN ('MD','DO','PMHNP') THEN
+              CASE 
+                WHEN ld.dea_priority = 4 THEN 'DEA'
+                WHEN ld.dea_priority = 3 THEN 'DEA-M'
+                WHEN ld.dea_priority = 2 THEN 'DEA-1R'
+                WHEN ld.dea_priority = 1 THEN 'DEA-X'
+                ELSE 'DEA-M'
+              END
+            ELSE ''
+        END AS dea_status,
+        CASE 
+            WHEN ld.provider_type IN ('MD','DO','PMHNP') THEN
+              CASE 
+                WHEN ld.csr_priority = 3 THEN 'CSR'
+                WHEN ld.csr_priority = 2 THEN 'CSR-X'
+                WHEN ld.csr_priority = 1 THEN 'CSR-M'
+                ELSE ''
+              END
+            ELSE ''
+        END AS csr_status,
+        CASE 
+            WHEN ld.provider_type = 'PMHNP' THEN 
+                CASE 
+                    WHEN ld.rn_priority = 4 THEN 'RN'
+                    WHEN ld.rn_priority = 3 THEN 'RN-C'
+                    WHEN ld.rn_priority = 2 THEN 'RN-Via C'
+                    WHEN ld.rn_priority = 1 THEN 'RN-X'
+                    ELSE 'RN-M'
+                END
+            ELSE ''
+        END AS rn_status,
+        CASE 
+            WHEN ld.np_priority = 2 THEN 'NP'
+            WHEN ld.np_priority = 1 THEN 'NP-X'
+            ELSE 'NP-M'
+        END AS np_status,
+        CASE WHEN ld.md_priority = 2 THEN 'State'
+             WHEN ld.md_priority = 1 THEN 'State-X'
+             ELSE 'State-M' END AS state_status_internal,
+        CASE
+            WHEN ld.provider_type = 'PMHNP'
+                 AND ld.dea_priority IN (4, 2)
+                 AND ld.csr_priority NOT IN (1, 2)
+                 AND ld.rn_priority IN (4, 3, 2)
+                 AND ld.np_priority = 2 THEN 'Yes'
+            WHEN ld.provider_type = 'PMHNP'
+                 AND ld.dea_priority = 3
+                 AND ld.csr_priority NOT IN (1, 2)
+                 AND ld.rn_priority IN (4, 3, 2)
+                 AND ld.np_priority = 2 THEN 'DEA Missing'
+            WHEN ld.provider_type IN ('MD','DO')
+                 AND ld.dea_priority IN (4, 2)
+                 AND ld.csr_priority NOT IN (1, 2)
+                 AND ld.md_priority = 2 THEN 'Yes'
+            WHEN ld.provider_type IN ('MD','DO')
+                 AND ld.dea_priority IN (3, 1)
+                 AND ld.csr_priority NOT IN (1, 2)
+                 AND ld.md_priority = 2 THEN 'DEA Missing'
+            WHEN ld.provider_type NOT IN ('MD', 'DO', 'NP', 'PMHNP')
+                 AND ld.md_priority = 2 THEN 'Yes'
+            ELSE 'No'
+        END AS complete_licensure
+    FROM license_data ld
+),
+
+/* ---------- In-progress apps (exclude renewals) ---------- */
+raw_apps AS (
+  SELECT
+      TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_PROVIDER_ID) AS contact_id,
+      UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE)) AS app_state,
+      TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)       AS app_status,
+      UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) AS credential_type,
+      UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_PROVIDER_TYPE))    AS app_provider_type
+  FROM analytics.staging.stg_verifiable_licensing_manager__license_application app
+  WHERE COALESCE(app.IS_LICENSING_MANAGER_LICENSE_APPLICATION_DELETED, FALSE) = FALSE
+    AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE 'COMPLETED%'
+    AND app.LICENSING_MANAGER_LICENSE_APPLICATION_TYPE <> 'Renewal'
+    AND UPPER(TRIM(COALESCE(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE,''))) NOT LIKE '%RENEWAL%'
+),
+
+/* NP state-license apps only (exclude RN apps) */
+state_apps AS (
+  SELECT
+    ra.contact_id,
+    ra.app_state,
+    CASE
+      WHEN LOWER(ra.app_status) LIKE '%submitted%' THEN 'Submitted'
+      WHEN LOWER(ra.app_status) LIKE '%pending%'   THEN 'Pending'
+      WHEN LOWER(ra.app_status) LIKE '%board%'     THEN 'Awaiting Board'
+      ELSE 'In Progress'
+    END AS app_status
+  FROM raw_apps ra
+  WHERE (
+          ra.credential_type LIKE '%FULL%'
+       OR ra.credential_type LIKE '%COMPACT%'
+       OR ra.credential_type LIKE '%STATE%'
+        )
+    AND (ra.app_provider_type IS NULL OR ra.app_provider_type <> 'RN')  -- ensure NP apps, not RN
+),
+
+/* DEA apps -> string per provider/state */
+apps_dea AS (
+  SELECT
+    ra.contact_id,
+    ra.app_state,
+    MAX(
+      CASE 
+        WHEN ra.credential_type LIKE '%DEA%' THEN
+          ra.app_state || ' (' ||
+          CASE 
+            WHEN ra.credential_type LIKE '%UNRESTRICTED%' THEN 'Unrestricted'
+            WHEN ra.credential_type LIKE '%RESTRICTED%'   THEN 'Restricted'
+            WHEN ra.credential_type LIKE '%CONVERSION%'   THEN 'Conversion'
+            ELSE 'DEA'
+          END || ' - ' ||
+          CASE
+            WHEN LOWER(ra.app_status) LIKE '%submitted%' THEN 'Submitted'
+            WHEN LOWER(ra.app_status) LIKE '%pending%'   THEN 'Pending'
+            WHEN LOWER(ra.app_status) LIKE '%board%'     THEN 'Awaiting Board'
+            ELSE 'In Progress'
+          END || ')'
+      END
+    ) AS in_progress_dea
+  FROM raw_apps ra
+  GROUP BY 1,2
+),
+
+/* CSR apps -> string per provider/state */
+apps_csr AS (
+  SELECT
+    ra.contact_id,
+    ra.app_state,
+    MAX(
+      CASE 
+        WHEN ra.credential_type LIKE '%CSR%' THEN
+          'CSR - ' ||
+          CASE
+            WHEN LOWER(ra.app_status) LIKE '%submitted%' THEN 'Submitted'
+            WHEN LOWER(ra.app_status) LIKE '%pending%'   THEN 'Pending'
+            WHEN LOWER(ra.app_status) LIKE '%board%'     THEN 'Awaiting Board'
+            ELSE 'In Progress'
+          END
+      END
+    ) AS in_progress_csr
+  FROM raw_apps ra
+  GROUP BY 1,2
+),
+
+/* Active DEA per provider/state with prescribing details */
+dea_state_detail AS (
+    SELECT
+        vc.contact_npi_number AS provider_npi,
+        UPPER(TRIM(d.dea_number_state)) AS dea_state,
+        UPPER(TRIM(d.dea_number_specification)) AS dea_specification,
+        TRIM(d.dea_number_drug_schedules) AS dea_schedules
+    FROM analytics.staging.stg_verifiable_contact vc
+    JOIN analytics.staging.stg_verifiable_dea_number d
+        ON TRIM(d.dea_number_provider_id) = vc.contact_id
+    WHERE COALESCE(d.is_dea_number_active, FALSE) = TRUE
+      AND UPPER(COALESCE(d.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+),
+
+/* Active CSR per provider/state for CSR - Active */
+csr_state_detail AS (
+    SELECT
+        vc.contact_npi_number AS provider_npi,
+        UPPER(TRIM(l.license_jurisdiction_state)) AS csr_state
+    FROM analytics.staging.stg_verifiable_contact vc
+    JOIN analytics.staging.stg_verifiable_licenses l
+      ON TRIM(l.license_provider_id) = vc.contact_id
+    WHERE UPPER(TRIM(l.license_type_abbreviation)) = 'CSR'
+      AND UPPER(TRIM(l.license_talkiatry_status)) = 'ACTIVE'
+),
+
+/* ===== FIXED: All active licenses + autonomous subset ONLY from NP/PMHNP active autonomy=Yes rows ===== */
+licenses AS (
+    WITH ActiveLicenses AS (
+        SELECT
+            TRIM(vl.LICENSE_PROVIDER_ID) AS contact_id,
+            UPPER(TRIM(vl.LICENSE_JURISDICTION_STATE)) AS license_state,
+            UPPER(TRIM(COALESCE(vl.LICENSE_TYPE_ABBREVIATION,''))) AS lic_type,
+            UPPER(TRIM(COALESCE(vl.LICENSE_SPECIFICATION,'')))     AS lic_spec,
+            UPPER(TRIM(COALESCE(vl.LICENSE_TALKIATRY_STATUS,'')))  AS talk_status,
+            CASE
+              WHEN UPPER(TRIM(COALESCE(vl.IS_LICENSE_AUTONOMY_PRIVILEGE, '')))
+                   = UPPER('Yes – State Allows | Fully Eligible')
+              THEN 1 ELSE 0
+            END AS autonomy_yes
+        FROM analytics.staging.stg_verifiable_licenses vl
+        JOIN analytics.staging.stg_verifiable_contact vc
+          ON vc.CONTACT_ID = vl.LICENSE_PROVIDER_ID
+        WHERE vl.IS_LICENSE_ACTIVE = TRUE
+          AND vl.LICENSE_STATUS IS NOT NULL
+          AND UPPER(TRIM(vl.LICENSE_STATUS)) <> 'TERMINATED'
+          AND UPPER(TRIM(vl.LICENSE_TALKIATRY_STATUS)) = 'ACTIVE'
+          AND (
+               (UPPER(TRIM(vc.CONTACT_TALKIATRY_PROVIDER_TYPE)) = 'PMHNP'
+                 AND UPPER(TRIM(vl.LICENSE_TYPE_ABBREVIATION)) IN ('NP','PMHNP'))
+            OR (UPPER(TRIM(vc.CONTACT_TALKIATRY_PROVIDER_TYPE)) <> 'PMHNP'
+                 AND COALESCE(UPPER(TRIM(vl.LICENSE_TYPE_ABBREVIATION)), '') NOT IN ('RN','CSR'))
+          )
+    ),
+    Contacts AS (
+        SELECT
+            TRIM(vc.CONTACT_ID) AS contact_id,
+            vc.CONTACT_NPI_NUMBER AS provider_npi
+        FROM analytics.staging.stg_verifiable_contact vc
+    )
+    SELECT
+        c.provider_npi,
+
+        /* unchanged */
+        ARRAY_TO_STRING(
+            ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(al.license_state))),
+            ', '
+        ) AS all_active_licenses,
+
+        /* FIX: autonomy only if NP/PMHNP + ACTIVE + not limited/training/temp + autonomy=yes */
+        ARRAY_TO_STRING(
+            ARRAY_SORT(
+                ARRAY_DISTINCT(
+                    ARRAY_AGG(
+                        CASE 
+                          WHEN al.lic_type IN ('NP','PMHNP')
+                           AND al.talk_status = 'ACTIVE'
+                           AND al.lic_spec NOT IN ('LIMITED','TRAINING','TEMPORARY')
+                           AND al.autonomy_yes = 1
+                          THEN al.license_state
+                        END
+                    )
+                )
+            ),
+            ', '
+        ) AS all_active_autonomous_licenses
+
+    FROM Contacts c
+    JOIN ActiveLicenses al ON c.contact_id = al.contact_id
+    GROUP BY c.provider_npi
+),
+
+combined AS (
+    /* Active / classified rows (restrict to states with ACTIVE NP license) */
+    SELECT
+        c.provider_id,
+        c.provider_name,
+        c.provider_type,
+        c.provider_npi,
+        e.employee_supervisor_name AS chief_name,
+        c.start_date,
+        c.sign_date,
+        c.state,
+        'Active' AS license_status,
+        c.compact_status,
+        c.dea_status,
+        c.csr_status,
+        c.rn_status,
+        c.np_status,
+        c.rx_authorization_status,
+        c.complete_licensure,
+        ad.in_progress_dea,
+        ac.in_progress_csr,
+        CONCAT(
+            dea.dea_state,
+            ' (',
+            COALESCE(dea.dea_specification, ''),
+            CASE WHEN NULLIF(TRIM(dea.dea_schedules), '') IS NOT NULL
+                 THEN ' - ' || dea.dea_schedules
+                 ELSE ''
+            END,
+            ')'
+        ) AS dea_active_details,
+        csra.csr_state AS csr_active_state,
+        l.all_active_licenses,
+        l.all_active_autonomous_licenses,
+        c.market_states,
+        c.np_autonomy_privilege,
+        1 AS active_flag,
+        c.created_at
+    FROM classified c
+    LEFT JOIN analytics.common.dim_employees e
+        ON c.provider_npi = e.employee_npi
+    LEFT JOIN licenses l
+        ON c.provider_npi = l.provider_npi
+    LEFT JOIN dea_state_detail dea
+        ON c.provider_npi = dea.provider_npi
+       AND c.state = dea.dea_state
+    LEFT JOIN csr_state_detail csra
+        ON c.provider_npi = csra.provider_npi
+       AND c.state = csra.csr_state
+    LEFT JOIN apps_dea ad
+        ON ad.contact_id = c.provider_id
+       AND ad.app_state = UPPER(TRIM(c.state))
+    LEFT JOIN apps_csr ac
+        ON ac.contact_id = c.provider_id
+       AND ac.app_state = UPPER(TRIM(c.state))
+    WHERE c.provider_type = 'PMHNP'
+      AND c.np_priority = 2                 -- keep only states where NP is ACTIVE
+
+    UNION ALL
+
+    /* In-progress only rows — NP license apps only (exclude RN apps) */
+    SELECT
+        p.provider_id,
+        p.provider_name,
+        p.provider_type,
+        p.provider_npi,
+        e.employee_supervisor_name AS chief_name,
+        p.start_date,
+        p.sign_date,
+        sa.app_state AS state,
+        sa.app_status AS license_status,
+        CASE 
+          WHEN p.provider_type = 'PMHNP' 
+               AND EXISTS (SELECT 1 FROM compact_map cm WHERE cm.s = sa.app_state) THEN 'Compact'
+          WHEN p.provider_type = 'PMHNP' THEN 'N/A'
+          ELSE '' 
+        END AS compact_status,
+
+        /* DEA/CSR status per app_state (same rules) */
+        CASE 
+          WHEN p.provider_type IN ('MD','DO','PMHNP') THEN
+            CASE
+              WHEN EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_dea_number d1
+                   WHERE d1.dea_number_provider_id = p.provider_id
+                     AND UPPER(TRIM(d1.dea_number_state)) = sa.app_state
+                     AND d1.is_dea_number_active = 'TRUE'
+                     AND UPPER(COALESCE(d1.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+                 ) THEN 'DEA'
+              WHEN sa.app_state IN ('GA','CA')
+                 AND EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_dea_number dx
+                   WHERE dx.dea_number_provider_id = p.provider_id
+                     AND UPPER(TRIM(dx.dea_number_state)) = sa.app_state
+                     AND dx.is_dea_number_active = 'FALSE'
+                 ) THEN 'DEA-X'
+              WHEN sa.app_state NOT IN ('GA','CA')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_dea_number cs
+                   WHERE cs.dea_number_provider_id = p.provider_id
+                     AND UPPER(TRIM(cs.dea_number_state)) = sa.app_state
+                     AND cs.is_dea_number_active = 'TRUE'
+                     AND UPPER(COALESCE(cs.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+                 )
+                 AND EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_dea_number os
+                   WHERE os.dea_number_provider_id = p.provider_id
+                     AND os.is_dea_number_active = 'TRUE'
+                     AND UPPER(COALESCE(os.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+                     AND UPPER(TRIM(os.dea_number_state)) <> sa.app_state
+                 ) THEN 'DEA-1R'
+              WHEN NOT EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_dea_number na
+                   WHERE na.dea_number_provider_id = p.provider_id
+                     AND na.is_dea_number_active = 'TRUE'
+                     AND UPPER(COALESCE(na.dea_number_specification,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+                 ) THEN 'DEA-M'
+              WHEN EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_dea_number ix
+                   WHERE ix.dea_number_provider_id = p.provider_id
+                     AND UPPER(TRIM(ix.dea_number_state)) = sa.app_state
+                     AND ix.is_dea_number_active = 'FALSE'
+                 ) THEN 'DEA-X'
+              ELSE 'DEA-M'
+            END
+          ELSE '' 
+        END AS dea_status,
+
+        CASE 
+          WHEN p.provider_type IN ('MD','DO','PMHNP') THEN
+            CASE
+              WHEN EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_licenses l
+                   WHERE l.license_provider_id = p.provider_id
+                     AND UPPER(TRIM(l.license_jurisdiction_state)) = sa.app_state
+                     AND UPPER(TRIM(l.license_type_abbreviation)) = 'CSR'
+                     AND UPPER(TRIM(l.license_talkiatry_status)) = 'ACTIVE'
+                 ) THEN 'CSR'
+              WHEN EXISTS (
+                   SELECT 1 FROM analytics.staging.stg_verifiable_licenses l
+                   WHERE l.license_provider_id = p.provider_id
+                     AND UPPER(TRIM(l.license_jurisdiction_state)) = sa.app_state
+                     AND UPPER(TRIM(l.license_type_abbreviation)) = 'CSR'
+                     AND UPPER(TRIM(l.license_talkiatry_status)) = 'INACTIVE'
+                 ) THEN 'CSR-X'
+              WHEN EXISTS (SELECT 1 FROM csr_states cs WHERE cs.s = sa.app_state)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM analytics.staging.stg_verifiable_licenses sub
+                     WHERE sub.license_provider_id = p.provider_id
+                       AND UPPER(TRIM(sub.license_jurisdiction_state)) = sa.app_state
+                       AND UPPER(TRIM(sub.license_type_abbreviation)) = 'CSR'
+                       AND UPPER(TRIM(sub.license_talkiatry_status)) = 'ACTIVE'
+                   ) THEN 'CSR-M'
+              ELSE ''
+            END
+          ELSE ''
+        END AS csr_status,
+
+        NULL AS rn_status,
+        NULL AS np_status,
+        NULL AS rx_authorization_status,
+        'No' AS complete_licensure,
+
+        ad.in_progress_dea,
+        ac.in_progress_csr,
+
+        CONCAT(
+            dea.dea_state,
+            ' (',
+            COALESCE(dea.dea_specification, ''),
+            CASE WHEN NULLIF(TRIM(dea.dea_schedules), '') IS NOT NULL
+                 THEN ' - ' || dea.dea_schedules
+                 ELSE ''
+            END,
+            ')'
+        ) AS dea_active_details,
+
+        csra.csr_state AS csr_active_state,
+
+        l.all_active_licenses,
+        l.all_active_autonomous_licenses,
+        p.market_states,
+        NULL AS np_autonomy_privilege,  -- apps won't have autonomy yet
+        2 AS active_flag,
+        NULL AS created_at
+    FROM provider p
+    JOIN state_apps sa
+        ON p.provider_id = sa.contact_id
+    LEFT JOIN analytics.common.dim_employees e
+        ON p.provider_npi = e.employee_npi
+    LEFT JOIN licenses l
+        ON p.provider_npi = l.provider_npi
+    LEFT JOIN apps_dea ad
+        ON ad.contact_id = p.provider_id
+       AND ad.app_state  = sa.app_state
+    LEFT JOIN apps_csr ac
+        ON ac.contact_id = p.provider_id
+       AND ac.app_state  = sa.app_state
+    LEFT JOIN dea_state_detail dea
+        ON p.provider_npi = dea.provider_npi
+       AND sa.app_state = dea.dea_state
+    LEFT JOIN csr_state_detail csra
+        ON p.provider_npi = csra.provider_npi
+       AND sa.app_state = csra.csr_state
+    WHERE p.provider_type = 'PMHNP'
+)
+
+SELECT
+    combined.provider_name                  AS "Provider Name",
+    combined.provider_type                  AS "Provider Type",
+    combined.provider_npi                   AS "Provider NPI",
+    combined.chief_name                     AS "Chief Name",
+    combined.sign_date                      AS "Sign Date",
+    combined.start_date                     AS "Start Date",
+    combined.all_active_licenses            AS "All Active Licenses",
+    combined.all_active_autonomous_licenses AS "All Active Autonomous Licenses",
+    MAX(combined.market_states) 
+      OVER (PARTITION BY combined.provider_id) AS "All Open Markets",
+    combined.state                          AS "License State",
+    combined.license_status                 AS "License Status",
+    combined.compact_status                 AS "Compact Status",
+    combined.dea_status                     AS "DEA Status",
+    combined.dea_active_details             AS "DEA - Active",
+    combined.in_progress_dea                AS "DEA - In Progress",
+    combined.csr_status                     AS "CSR Status",
+    combined.csr_active_state               AS "CSR - Active",
+    combined.in_progress_csr                AS "CSR - In Progress",
+    combined.rn_status                      AS "RN Status",
+    combined.np_status                      AS "NP Status",
+    combined.np_autonomy_privilege          AS "NP Autonomy Privilege",
+
+    /* Market Complete with RN/NP > DEA > CSR priority */
+    CASE
+      WHEN UPPER(TRIM(combined.license_status)) <> 'ACTIVE' THEN 'License In Progress'
+      WHEN combined.np_status IN ('NP-M','NP-X') THEN 'NP Needed'
+      WHEN combined.rn_status IN ('RN-M','RN-X') THEN 'RN Needed'
+      WHEN combined.dea_status IN ('DEA-M','DEA-X')
+           AND COALESCE(NULLIF(TRIM(combined.in_progress_dea), ''), NULL) IS NOT NULL THEN 'DEA In Progress'
+      WHEN combined.dea_status IN ('DEA-M','DEA-X') THEN 'DEA Needed'
+      WHEN combined.csr_status IN ('CSR-M','CSR-X')
+           AND COALESCE(NULLIF(TRIM(combined.in_progress_csr), ''), NULL) IS NOT NULL THEN 'CSR In Progress'
+      WHEN combined.csr_status IN ('CSR-M','CSR-X') THEN 'CSR Needed'
+      WHEN combined.complete_licensure = 'Yes' THEN 'Yes'
+      ELSE 'Yes'
+    END AS "Market Complete",
+
+    COALESCE(om.market_on, 'No')            AS "Market On"
+
+FROM combined
+LEFT JOIN open_markets om
+  ON om.provider_id = combined.provider_id
+ AND om.state = UPPER(TRIM(combined.state))
+WHERE combined.state IS NOT NULL
+  AND combined.provider_type = 'PMHNP'
+  AND combined.start_date >= DATEADD(month, -12, CURRENT_DATE())
+/* one row per provider+state: prefer Active rows; tie-break by latest created_at */
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY combined.provider_id, UPPER(TRIM(combined.state))
+  ORDER BY combined.active_flag ASC, combined.created_at DESC NULLS LAST
+) = 1
+ORDER BY "Provider Name", combined.state
