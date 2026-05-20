@@ -1,0 +1,207 @@
+/* ===== Therapist Minimal Query (Split License State / License Status) ===== */
+WITH market_states AS (
+    SELECT
+        provider_practice_location_provider_id AS provider_id,
+        COALESCE(LISTAGG(provider_practice_location_state, ', '), ', ') AS market_states
+    FROM analytics.staging.STG_VERIFIABLE_PROVIDER_PRACTICE_LOCATION
+    GROUP BY 1
+),
+open_markets AS (
+  SELECT
+    provider_practice_location_provider_id AS provider_id,
+    UPPER(TRIM(provider_practice_location_state)) AS state,
+    'Yes' AS market_on
+  FROM analytics.staging.STG_VERIFIABLE_PROVIDER_PRACTICE_LOCATION
+  WHERE provider_practice_location_state IS NOT NULL
+  GROUP BY 1,2
+),
+provider AS (
+    SELECT
+        c.contact_id AS provider_id,
+        c.contact_name AS provider_name,
+        c.contact_talkiatry_provider_type AS provider_type,
+        c.contact_npi_number AS provider_npi,
+        CAST(c.contact_start_date AS DATE) AS start_date,
+        CAST(c.contact_created_at AS DATE) AS sign_date,
+        ms.market_states
+    FROM analytics.staging.stg_verifiable_contact c
+    LEFT JOIN market_states ms ON ms.provider_id = c.contact_id
+    WHERE c.contact_name NOT IN ('VF LA Test', 'AdelineTest LeyTest')
+      AND c.contact_provider_status NOT IN ('Terminated', 'Withdrew')
+),
+
+/* --------------------------------------------------------------------
+   SINGLE SOURCE OF TRUTH:
+   "Active license state" = Verifiable/Talkiatry Active, non-RN/CSR
+--------------------------------------------------------------------- */
+active_license_states AS (
+    SELECT
+        TRIM(vl.LICENSE_PROVIDER_ID)          AS provider_id,
+        UPPER(TRIM(vl.LICENSE_JURISDICTION_STATE)) AS state
+    FROM analytics.staging.stg_verifiable_licenses vl
+    WHERE vl.LICENSE_JURISDICTION_STATE IS NOT NULL
+      AND UPPER(TRIM(vl.LICENSE_TALKIATRY_STATUS)) = 'ACTIVE'
+      AND COALESCE(UPPER(TRIM(vl.LICENSE_TYPE_ABBREVIATION)), '') NOT IN ('RN','CSR')
+),
+
+/* Roll up EXACTLY those active states per provider */
+licenses AS (
+    SELECT
+        als.provider_id,
+        ARRAY_TO_STRING(
+            ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(als.state))),
+            ', '
+        ) AS all_active_licenses
+    FROM active_license_states als
+    GROUP BY als.provider_id
+),
+
+/* Classify license rows per provider+state using SAME definition */
+license_data AS (
+    SELECT
+        p.provider_id,
+        p.provider_name,
+        p.provider_type,
+        p.provider_npi,
+        p.start_date,
+        p.sign_date,
+        UPPER(TRIM(l.license_jurisdiction_state)) AS state,
+
+        MAX(
+          CASE
+            /* ACTIVE = same as active_license_states */
+            WHEN UPPER(TRIM(COALESCE(l.license_talkiatry_status,''))) = 'ACTIVE'
+             AND COALESCE(UPPER(TRIM(l.license_type_abbreviation)), '') NOT IN ('RN','CSR')
+            THEN 2
+
+            /* INACTIVE (still a license row, just not active) */
+            WHEN UPPER(TRIM(COALESCE(l.license_talkiatry_status,''))) = 'INACTIVE'
+             AND COALESCE(UPPER(TRIM(l.license_type_abbreviation)), '') NOT IN ('RN','CSR')
+            THEN 1
+
+            ELSE 0
+          END
+        ) AS state_priority,
+
+        MAX(l.license_created_at) AS created_at,
+        p.market_states
+    FROM provider p
+    LEFT JOIN analytics.staging.stg_verifiable_licenses l
+      ON p.provider_id = l.license_provider_id
+     AND l.license_jurisdiction_state IS NOT NULL
+    GROUP BY 1,2,3,4,5,6,7,10
+),
+
+classified AS (
+  SELECT
+    ld.*,
+    CASE WHEN ld.state_priority = 2 THEN 'Yes'
+         WHEN ld.state_priority = 1 THEN 'No'
+         ELSE 'No' END AS complete_licensure
+  FROM license_data ld
+),
+
+/* Build combined like other personas, but now license_status is derived */
+combined AS (
+  /* License-based rows (Active or Inactive) */
+  SELECT
+      c.provider_id,
+      c.provider_name,
+      c.provider_type,
+      c.provider_npi,
+      e.employee_supervisor_name AS chief_name,
+      c.start_date,
+      c.sign_date,
+      c.state,
+
+      /* ===== ACTIVE/INACTIVE computed from SAME rule as rollup ===== */
+      CASE
+        WHEN c.state_priority = 2 THEN 'Active'
+        WHEN c.state_priority = 1 THEN 'Inactive'
+        ELSE ''
+      END AS license_status,
+
+      c.complete_licensure,
+      l.all_active_licenses,
+      c.market_states,
+      1 AS active_flag,
+      c.created_at
+  FROM classified c
+  LEFT JOIN analytics.common.dim_employees e
+    ON c.provider_npi = e.employee_npi
+  LEFT JOIN licenses l
+    ON c.provider_id = l.provider_id
+
+  UNION ALL
+
+  /* In-progress applications: keep state, use app_status as license_status */
+  SELECT
+      p.provider_id,
+      p.provider_name,
+      p.provider_type,
+      p.provider_npi,
+      e.employee_supervisor_name AS chief_name,
+      p.start_date,
+      p.sign_date,
+      sa.app_state AS state,
+      sa.app_status AS license_status,
+      'No' AS complete_licensure,
+      l.all_active_licenses,
+      p.market_states,
+      2 AS active_flag,
+      NULL AS created_at
+  FROM provider p
+  JOIN (
+      SELECT
+        TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_PROVIDER_ID) AS contact_id,
+        UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE)) AS app_state,
+        CASE
+          WHEN LOWER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)) LIKE '%submitted%' THEN 'Submitted'
+          WHEN LOWER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)) LIKE '%pending%'   THEN 'Pending'
+          WHEN LOWER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)) LIKE '%board%'     THEN 'Awaiting Board'
+          ELSE 'In Progress'
+        END AS app_status,
+        TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE) AS credential_type
+      FROM analytics.staging.stg_verifiable_licensing_manager__license_application app
+      WHERE COALESCE(app.IS_LICENSING_MANAGER_LICENSE_APPLICATION_DELETED, FALSE) = FALSE
+        AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE 'COMPLETED%'
+        AND app.LICENSING_MANAGER_LICENSE_APPLICATION_TYPE <> 'Renewal'
+        AND UPPER(TRIM(COALESCE(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE,''))) NOT LIKE '%RENEWAL%'
+        AND (
+              UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%FULL%'
+           OR UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%COMPACT%'
+           OR UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%STATE%'
+        )
+  ) sa
+      ON p.provider_id = sa.contact_id
+  LEFT JOIN analytics.common.dim_employees e
+      ON p.provider_npi = e.employee_npi
+  LEFT JOIN licenses l
+      ON p.provider_id = l.provider_id
+)
+
+SELECT
+    combined.provider_name               AS "Provider Name",
+    combined.provider_type               AS "Provider Type",
+    combined.provider_npi                AS "Provider NPI",
+    combined.chief_name                  AS "Chief Name",
+    combined.sign_date                   AS "Sign Date",
+    combined.start_date                  AS "Start Date",
+    combined.all_active_licenses         AS "All Active Licenses",
+    combined.market_states               AS "All Open Markets",
+    combined.state                       AS "License State",
+    combined.license_status              AS "License Status",
+    combined.complete_licensure          AS "Complete Licensure",
+    COALESCE(om.market_on, 'No')         AS "Market On"
+FROM combined
+LEFT JOIN open_markets om
+  ON om.provider_id = combined.provider_id
+ AND om.state = UPPER(TRIM(combined.state))
+WHERE combined.state IS NOT NULL
+  AND combined.provider_type NOT IN ('MD','DO','PMHNP')  -- therapists / non-prescribers
+  AND combined.start_date >= DATEADD(month, -6, CURRENT_DATE())
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY combined.provider_id, UPPER(TRIM(combined.state))
+  ORDER BY combined.active_flag ASC, combined.created_at DESC NULLS LAST
+) = 1
+ORDER BY "Provider Name", combined.state
