@@ -1,0 +1,13 @@
+SELECT
+    ap.provider_npi
+  , ap.provider_primary_practice_state
+  , ap.is_provider_online_scheduling_enabled
+  , ap.is_provider_NP_enabled
+  , ap.provider_daily_new_patient_max
+  , ap.is_provider_adhd_preferred
+  , ap.is_provider_reject_controlled_substances_intakes
+  , de.employee_state
+
+FROM analytics.staging.stg_aptible_providers AS ap
+LEFT JOIN analytics.common.dim_employees AS de
+  ON ap.provider_npi = de.employee_npi
