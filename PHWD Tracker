@@ -1,0 +1,393 @@
+WITH employees_list AS
+(
+    SELECT
+        'Psych' AS provider_group
+      , CASE
+            WHEN employee_full_name IN ('Angela Scalise', 'Angela Shields', 'Sophia Monsour')
+              OR employee_supervisor_name IN ('Angela Scalise', 'Angela Shields', 'Sophia Monsour') THEN 'Tyler Forst'
+            WHEN employee_full_name IN ('Cesar De Paz', 'Laura Ginory')
+              OR employee_supervisor_name IN ('Cesar De Paz', 'Laura Ginory') THEN 'Kimberly Gallagher'
+            WHEN employee_full_name = 'Daniel Weiss'
+              OR employee_supervisor_name = 'Daniel Weiss' THEN 'Mia Steck'
+            WHEN employee_full_name = 'Rebecca Kostopoulos'
+              OR employee_supervisor_name = 'Rebecca Kostopoulos' THEN 'Kristina Kremer'
+        END AS gm_name
+      , employee_supervisor_name AS chief_name
+      , employee_full_name
+      , de.employee_ecw_user_id AS provider_id
+      , de.employee_npi AS npi
+      , de.employee_current_clinical_fte_status AS current_clinical_fte
+      , provider_daily_new_patient_max
+      , employee_separation_date
+      , GREATEST_IGNORE_NULLS(employee_current_start_date, employee_rehire_date) AS start_date
+    FROM analytics.common.dim_employees de
+    LEFT JOIN analytics.staging.stg_aptible_providers ap
+        ON de.employee_npi = ap.provider_npi
+    LEFT JOIN analytics.staging.stg_ecw_providers ecw
+        ON de.employee_npi = ecw.provider_npi
+    WHERE employee_current_role IN ('Staff Psychiatrist', 'Nurse Practitioner')
+      AND employee_separation_date IS NULL
+      AND GREATEST_IGNORE_NULLS(employee_current_start_date, employee_rehire_date) <= CURRENT_DATE
+
+    UNION ALL
+
+    SELECT
+        'Therapy' AS provider_group
+      , gm_full_name AS gm_name
+      , employee_supervisor_name AS chief_name
+      , employee_full_name
+      , de.employee_ecw_user_id AS provider_id
+      , de.employee_npi AS npi
+      , de.employee_current_clinical_fte_status AS current_clinical_fte
+      , provider_daily_new_patient_max
+      , employee_separation_date
+      , GREATEST_IGNORE_NULLS(employee_current_start_date, employee_rehire_date) AS start_date
+    FROM analytics.common.dim_employees de
+    JOIN business_self_serve.google_drive_operations.gm_to_chief_mapping_data m
+        ON de.employee_supervisor_id = m.supervisor_employee_id
+        OR de.employee_id = m.supervisor_employee_id
+    LEFT JOIN analytics.staging.stg_aptible_providers ap
+        ON de.employee_npi = ap.provider_npi
+    WHERE employee_current_role IN ('Therapist')
+      AND employee_separation_date IS NULL
+      AND GREATEST_IGNORE_NULLS(employee_current_start_date, employee_rehire_date) <= CURRENT_DATE
+),
+
+daily_loa_records AS
+(
+    SELECT
+        DATE_TRUNC('DAY', h.dbt_updated_at) AS day_date
+      , h.provider_id_ecw
+      , MAX(de.employee_full_name) AS clinician_name
+      , MAX(de.employee_supervisor_name) AS chief_name
+      , MAX(h.dbt_updated_at) AS last_ts
+    FROM analytics.staging.stg_adp_clinician_bonus_history h
+    LEFT JOIN analytics.common.dim_employees de
+        ON h.provider_id_ecw = de.employee_ecw_user_id
+    WHERE provider_id_ecw IS NOT NULL
+    GROUP BY 1,2
+),
+
+daily_loa_ending AS
+(
+    SELECT
+        dr.day_date
+      , dr.provider_id_ecw
+      , dr.clinician_name
+      , dr.chief_name
+      , h.hire_rehire_date
+      , h.clinician_fte AS ending_fte
+      , h.leave_of_absence_start_date
+      , h.leave_of_absence_return_date
+      , h.dbt_scd_id
+    FROM daily_loa_records dr
+    JOIN analytics.staging.stg_adp_clinician_bonus_history h
+        ON h.provider_id_ecw = dr.provider_id_ecw
+       AND h.dbt_updated_at = dr.last_ts
+),
+
+daily_loa_with_prev AS
+(
+    SELECT
+        day_date
+      , provider_id_ecw
+      , clinician_name
+      , chief_name
+      , hire_rehire_date
+      , ending_fte
+      , leave_of_absence_start_date
+      , leave_of_absence_return_date
+      , dbt_scd_id
+      , LAG(leave_of_absence_start_date) OVER (
+            PARTITION BY provider_id_ecw
+            ORDER BY day_date
+        ) AS prev_day_loa_start
+    FROM daily_loa_ending
+),
+
+loa_expanded AS
+(
+    SELECT *
+    FROM daily_loa_with_prev
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY provider_id_ecw, prev_day_loa_start
+        ORDER BY day_date DESC
+    ) = 1
+),
+
+loa_final AS
+(
+    SELECT
+        provider_id
+      , employee_full_name
+      , loa_start_date
+      , COALESCE(MAX(loa_last_date), DATEADD('year', 1, MAX(loa_start_date))) AS loa_last_date
+    FROM
+    (
+        SELECT
+            provider_id_ecw AS provider_id
+          , clinician_name AS employee_full_name
+          , CASE
+                WHEN leave_of_absence_return_date IS NOT NULL THEN prev_day_loa_start
+                ELSE leave_of_absence_start_date
+            END AS loa_start_date
+          , MAX(DATEADD('day', -1, leave_of_absence_return_date)) AS loa_last_date
+        FROM loa_expanded
+        WHERE
+            (prev_day_loa_start IS NOT NULL AND leave_of_absence_return_date IS NOT NULL)
+            OR (prev_day_loa_start IS NULL AND leave_of_absence_start_date IS NOT NULL)
+        GROUP BY 1,2,3
+
+        UNION
+
+        SELECT DISTINCT
+            i.provider_id
+          , employee_full_name
+          , leave_of_absence_start_date AS loa_start_date
+          , COALESCE(
+                DATEADD('day', -1, leave_of_absence_return_date)
+              , DATEADD('year', 1, leave_of_absence_start_date)
+            ) AS loa_last_date
+        FROM analytics.products.incentive_compensation_provider_details i
+        JOIN analytics.common.dim_employees d
+            ON i.provider_id = d.employee_ecw_user_id
+        WHERE loa_start_date IS NOT NULL
+    )
+    GROUP BY 1,2,3
+),
+
+provider_dates AS
+(
+    SELECT
+        de.provider_id
+      , de.start_date
+      , dd.date_date
+      , FLOOR(DATEDIFF('day', de.start_date, dd.date_date) / 7) + 1 AS week_num
+      , DATEADD(
+            'day',
+            7 * FLOOR(DATEDIFF('day', de.start_date, dd.date_date) / 7),
+            de.start_date
+        ) AS onboarding_week_start
+      , DATEADD(
+            'day',
+            7 * (FLOOR(DATEDIFF('day', de.start_date, dd.date_date) / 7) + 1),
+            de.start_date
+        ) AS onboarding_week_complete_date
+    FROM analytics.common.dim_date dd
+    JOIN employees_list de
+        ON dd.date_date >= de.start_date
+       AND dd.date_date < DATEADD('day', 84, de.start_date)
+       AND dd.date_date < CURRENT_DATE
+    WHERE FLOOR(DATEDIFF('day', de.start_date, dd.date_date) / 7) + 1 BETWEEN 1 AND 12
+      AND DATEADD(
+            'day',
+            7 * (FLOOR(DATEDIFF('day', de.start_date, dd.date_date) / 7) + 1),
+            de.start_date
+          ) <= CURRENT_DATE
+),
+
+pto AS
+(
+    SELECT
+        pd.onboarding_week_start AS week
+      , p.provider_id
+      , pd.week_num
+      , SUM(
+            CASE
+                WHEN l.provider_id IS NULL THEN LEAST(provider_pto_minutes / NULLIF(schedule_minutes, 0), 1)
+            END
+        ) AS pto
+    FROM analytics.prep.prep_provider_daily_schedule_optimization p
+    JOIN provider_dates pd
+        ON p.provider_id = pd.provider_id
+       AND p.date_date = pd.date_date
+    LEFT JOIN loa_final l
+        ON p.date_date BETWEEN l.loa_start_date AND l.loa_last_date
+       AND p.provider_id = l.provider_id
+    GROUP BY 1,2,3
+),
+
+working_days AS
+(
+    SELECT
+        pd.onboarding_week_start AS week
+      , pd.provider_id
+      , pd.week_num
+      , SUM(CASE WHEN dd.is_date_work_day = 1 THEN 1 ELSE 0 END) AS working_days
+      , SUM(CASE WHEN dd.is_date_work_day = 1 AND l.provider_id IS NOT NULL THEN 1 ELSE 0 END) AS loa
+      , SUM(CASE WHEN dd.is_date_work_day = 1 AND l.provider_id IS NULL THEN 1 ELSE 0 END) AS working_days_excl_loa
+    FROM provider_dates pd
+    JOIN analytics.common.dim_date dd
+        ON pd.date_date = dd.date_date
+    LEFT JOIN loa_final l
+        ON pd.date_date BETWEEN l.loa_start_date AND l.loa_last_date
+       AND pd.provider_id = l.provider_id
+    GROUP BY 1,2,3
+),
+
+adjusted_working_days AS
+(
+    SELECT
+        w.week
+      , w.provider_id
+      , w.week_num
+      , w.working_days
+      , COALESCE(p.pto, 0) AS pto
+      , w.loa
+      , GREATEST_IGNORE_NULLS(0, w.working_days_excl_loa - COALESCE(p.pto, 0)) AS adj_working_days
+    FROM working_days w
+    LEFT JOIN pto p
+        ON w.week = p.week
+       AND w.provider_id = p.provider_id
+       AND w.week_num = p.week_num
+),
+
+fte AS
+(
+    SELECT
+        pd.onboarding_week_start AS week
+      , c.provider_id
+      , pd.week_num
+      , AVG(provider_clinical_fte_float_coalesced) AS provider_clinical_fte_float_coalesced
+    FROM analytics.products.provider_clinical_utilization_weekly c
+    JOIN provider_dates pd
+        ON c.provider_id = pd.provider_id
+       AND c.visit_week >= pd.onboarding_week_start
+       AND c.visit_week < DATEADD('day', 7, pd.onboarding_week_start)
+    GROUP BY 1,2,3
+),
+
+visits AS
+(
+    SELECT
+        pd.onboarding_week_start AS week
+      , fv.visit_provider_id AS provider_id
+      , pd.week_num
+
+      -- PHWD remains based on actual billable visit hours only
+      , SUM(CASE
+            WHEN fv.is_visit_billable = 1
+                THEN fv.visit_duration_minutes
+        END) / 60.0 AS total_patient_hours
+
+      -- Future appointments count as scheduled; past appointments count only if CHK/PEN/ARR
+      , COUNT(DISTINCT CASE
+            WHEN (
+                    fv.visit_date >= CURRENT_DATE
+                 OR (
+                        fv.visit_date < CURRENT_DATE
+                    AND fv.visit_status IN ('CHK', 'PEN', 'ARR')
+                    )
+                 )
+             AND e.provider_group = 'Psych'
+             AND fv.visit_type_category = 'NP'
+                THEN fv.patient_id
+            WHEN (
+                    fv.visit_date >= CURRENT_DATE
+                 OR (
+                        fv.visit_date < CURRENT_DATE
+                    AND fv.visit_status IN ('CHK', 'PEN', 'ARR')
+                    )
+                 )
+             AND e.provider_group = 'Therapy'
+             AND fv.visit_type = 'Tele Refer'
+                THEN fv.patient_id
+        END) AS new_patients
+
+      , COUNT(DISTINCT CASE
+            WHEN fv.visit_date >= CURRENT_DATE
+              OR (
+                    fv.visit_date < CURRENT_DATE
+                AND fv.visit_status IN ('CHK', 'PEN', 'ARR')
+                 )
+                THEN fv.patient_id
+        END) AS all_patients
+
+    FROM analytics.common.fct_visits fv
+    JOIN employees_list e
+        ON fv.visit_provider_id = e.provider_id
+    JOIN provider_dates pd
+        ON fv.visit_provider_id = pd.provider_id
+       AND fv.visit_date = pd.date_date
+    GROUP BY 1,2,3
+),
+
+patient_hours_per_wd AS
+(
+    SELECT
+        w.week
+      , w.provider_id
+      , w.week_num
+      , COALESCE(v.total_patient_hours, 0) AS total_patient_hours
+      , COALESCE(f.provider_clinical_fte_float_coalesced, e.current_clinical_fte) AS provider_clinical_fte_float_coalesced
+      , w.working_days
+      , w.loa
+      , w.pto
+      , w.adj_working_days
+      , COALESCE(f.provider_clinical_fte_float_coalesced, e.current_clinical_fte) * w.adj_working_days AS clinical_working_days
+      , COALESCE(v.total_patient_hours, 0)
+            / NULLIF(COALESCE(f.provider_clinical_fte_float_coalesced, e.current_clinical_fte) * w.adj_working_days, 0)
+            AS patient_hours_per_wd
+    FROM adjusted_working_days w
+    JOIN employees_list e
+        ON w.provider_id = e.provider_id
+    LEFT JOIN fte f
+        ON w.week = f.week
+       AND w.provider_id = f.provider_id
+       AND w.week_num = f.week_num
+    LEFT JOIN visits v
+        ON w.week = v.week
+       AND w.provider_id = v.provider_id
+       AND w.week_num = v.week_num
+),
+
+base AS
+(
+    SELECT
+        e.npi
+      , a.week_num
+      , a.total_patient_hours
+      , a.clinical_working_days
+      , a.patient_hours_per_wd
+    FROM patient_hours_per_wd a
+    JOIN employees_list e
+        ON a.provider_id = e.provider_id
+)
+
+SELECT
+    npi
+
+  , CASE
+        WHEN COUNT(DISTINCT CASE WHEN week_num BETWEEN 1 AND 4 THEN week_num END) = 4
+        THEN SUM(CASE WHEN week_num BETWEEN 1 AND 4 THEN total_patient_hours END)
+             / NULLIF(SUM(CASE WHEN week_num BETWEEN 1 AND 4 THEN clinical_working_days END), 0)
+    END AS month_0_phwd
+
+  , CASE
+        WHEN COUNT(DISTINCT CASE WHEN week_num BETWEEN 5 AND 8 THEN week_num END) = 4
+        THEN SUM(CASE WHEN week_num BETWEEN 5 AND 8 THEN total_patient_hours END)
+             / NULLIF(SUM(CASE WHEN week_num BETWEEN 5 AND 8 THEN clinical_working_days END), 0)
+    END AS month_1_phwd
+
+  , CASE
+        WHEN COUNT(DISTINCT CASE WHEN week_num BETWEEN 9 AND 12 THEN week_num END) = 4
+        THEN SUM(CASE WHEN week_num BETWEEN 9 AND 12 THEN total_patient_hours END)
+             / NULLIF(SUM(CASE WHEN week_num BETWEEN 9 AND 12 THEN clinical_working_days END), 0)
+    END AS month_2_phwd
+
+  , AVG(CASE WHEN week_num = 1 THEN patient_hours_per_wd END) AS week_1_phwd
+  , AVG(CASE WHEN week_num = 2 THEN patient_hours_per_wd END) AS week_2_phwd
+  , AVG(CASE WHEN week_num = 3 THEN patient_hours_per_wd END) AS week_3_phwd
+  , AVG(CASE WHEN week_num = 4 THEN patient_hours_per_wd END) AS week_4_phwd
+  , AVG(CASE WHEN week_num = 5 THEN patient_hours_per_wd END) AS week_5_phwd
+  , AVG(CASE WHEN week_num = 6 THEN patient_hours_per_wd END) AS week_6_phwd
+  , AVG(CASE WHEN week_num = 7 THEN patient_hours_per_wd END) AS week_7_phwd
+  , AVG(CASE WHEN week_num = 8 THEN patient_hours_per_wd END) AS week_8_phwd
+  , AVG(CASE WHEN week_num = 9 THEN patient_hours_per_wd END) AS week_9_phwd
+  , AVG(CASE WHEN week_num = 10 THEN patient_hours_per_wd END) AS week_10_phwd
+  , AVG(CASE WHEN week_num = 11 THEN patient_hours_per_wd END) AS week_11_phwd
+  , AVG(CASE WHEN week_num = 12 THEN patient_hours_per_wd END) AS week_12_phwd
+
+FROM base
+GROUP BY npi
+ORDER BY npi
