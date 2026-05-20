@@ -1,0 +1,4 @@
+select 
+employee_npi,
+employee_current_fte_ratio
+from analytics.common.dim_employees
