@@ -1,0 +1,134 @@
+WITH verifiable AS (
+    SELECT
+        CONTACT_ID AS PROVIDER_ID,
+        CONTACT_NAME AS PROVIDER_NAME,
+        CONTACT_TALKIATRY_PROVIDER_TYPE AS PROVIDER_TYPE,
+        CONTACT_NPI_NUMBER AS NPI,
+        CAST(CONTACT_START_DATE AS DATE) AS START_DATE,
+        CAST(CONTACT_TERMINATION_DATE AS DATE) AS END_DATE,
+        CONTACT_PROVIDER_STATUS AS PROVIDER_STATUS,
+        LOWER(REGEXP_REPLACE(CONTACT_NAME, '[^a-zA-Z ]', '')) AS NORMALIZED_NAME
+    FROM ANALYTICS.STAGING.STG_VERIFIABLE_CONTACT
+    WHERE 
+        (
+            CONTACT_START_DATE >= DATEADD(month, -12, CURRENT_DATE())
+            OR CONTACT_START_DATE > CURRENT_DATE()
+        )
+        -- ✅ Include all statuses, but exclude only if termination date is in the past
+        AND (
+            CONTACT_TERMINATION_DATE IS NULL
+            OR CONTACT_TERMINATION_DATE > CURRENT_DATE()
+        )
+        AND UPPER(CONTACT_NAME) NOT LIKE '%TEST%'  -- exclude test providers
+),
+
+jira AS (
+    SELECT 
+        FULL_NAME,
+        INITCAP(REPLACE(SPLIT_PART(MANAGER, '@', 1), '.', ' ')) AS CHIEF_NAME,
+        NPI,
+        CAST(START_DATE AS DATE) AS START_DATE,
+        CAST(WITHDRAWAL_DATE AS DATE) AS WITHDRAWAL_DATE,
+        SCHEDULE_MADE,
+        PUBLISHED_HEALOW_PROFILE,
+        HARDWARE_PACKAGE,
+        LAPTOP_TRACKING,
+        CASE
+            WHEN TRIM(HEALOW_BIO) IS NULL OR TRIM(HEALOW_BIO) = '' THEN 'No'
+            ELSE 'Yes'
+        END AS HAS_HEALOW_BIO,
+        SHIPMENT_NOTIFICATION_SENT_,
+        E_CW_SCHEDULE_AUDIT,
+        HEALTH_GRADE_PROFILE_COMPLETE,
+        PSYCH_TODAY_PROFILE_COMPLETE,
+        WEB_MD_PROFILE_COMPLETE,
+        ZOC_DOC_PROFILE_COMPLETE,
+        LOWER(REGEXP_REPLACE(FULL_NAME, '[^a-zA-Z ]', '')) AS NORMALIZED_NAME
+    FROM BUSINESS_SELF_SERVE.GOOGLE_DRIVE_OPERATIONS.END_TO_END_ONBOARDING_INFORMATION_PROVIDER_ONBOARDING_JIRA
+    WHERE UPPER(FULL_NAME) NOT LIKE '%TEST%'  -- ✅ exclude test entries
+),
+
+matched AS (
+    SELECT
+        v.PROVIDER_ID,
+        v.PROVIDER_NAME,
+        v.PROVIDER_TYPE,
+        v.NPI,
+        v.START_DATE,
+        v.END_DATE,
+        v.PROVIDER_STATUS,
+        j.CHIEF_NAME,
+        j.SCHEDULE_MADE,
+        j.PUBLISHED_HEALOW_PROFILE,
+        j.HARDWARE_PACKAGE,
+        j.LAPTOP_TRACKING,
+        j.HAS_HEALOW_BIO,
+        j.SHIPMENT_NOTIFICATION_SENT_,
+        j.E_CW_SCHEDULE_AUDIT,
+        j.HEALTH_GRADE_PROFILE_COMPLETE,
+        j.PSYCH_TODAY_PROFILE_COMPLETE,
+        j.WEB_MD_PROFILE_COMPLETE,
+        j.ZOC_DOC_PROFILE_COMPLETE,
+        CASE
+            WHEN j.NPI IS NULL AND j.FULL_NAME IS NULL THEN 'Missing in JIRA'
+            WHEN v.NPI IS NULL AND v.PROVIDER_NAME IS NULL THEN 'Missing in Verifiable'
+            ELSE 'Match Found'
+        END AS COMMENTS,
+        CASE 
+            WHEN j.NPI IS NOT NULL AND j.NPI = v.NPI THEN 1  -- NPI match (strongest)
+            WHEN j.NORMALIZED_NAME = v.NORMALIZED_NAME THEN 2  -- name match
+            WHEN SOUNDEX(j.NORMALIZED_NAME) = SOUNDEX(v.NORMALIZED_NAME) THEN 3  -- fuzzy
+            ELSE 4
+        END AS MATCH_RANK
+    FROM verifiable v
+    LEFT JOIN jira j
+        ON (
+            (v.NPI IS NOT NULL AND v.NPI = j.NPI)
+            OR (
+                (v.NPI IS NULL OR j.NPI IS NULL)
+                AND (
+                    v.NORMALIZED_NAME = j.NORMALIZED_NAME
+                    OR SOUNDEX(v.NORMALIZED_NAME) = SOUNDEX(j.NORMALIZED_NAME)
+                )
+            )
+        )
+),
+
+deduped AS (
+    SELECT *
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY COALESCE(NPI, PROVIDER_NAME)
+                   ORDER BY MATCH_RANK ASC, START_DATE DESC
+               ) AS rn
+        FROM matched
+    )
+    WHERE rn = 1  -- ✅ ensure one row per provider
+)
+
+SELECT
+    PROVIDER_NAME,
+    PROVIDER_TYPE,
+    NPI,
+    CHIEF_NAME,
+    START_DATE,
+    END_DATE,
+    PROVIDER_STATUS,
+    SCHEDULE_MADE,
+    PUBLISHED_HEALOW_PROFILE,
+    HARDWARE_PACKAGE,
+    LAPTOP_TRACKING,
+    HAS_HEALOW_BIO,
+    SHIPMENT_NOTIFICATION_SENT_,
+    E_CW_SCHEDULE_AUDIT,
+    HEALTH_GRADE_PROFILE_COMPLETE,
+    PSYCH_TODAY_PROFILE_COMPLETE,
+    WEB_MD_PROFILE_COMPLETE,
+    ZOC_DOC_PROFILE_COMPLETE,
+    COMMENTS
+FROM deduped
+WHERE COMMENTS <> 'Missing in Verifiable'
+ORDER BY
+    START_DATE DESC,
+    PROVIDER_NAME ASC
