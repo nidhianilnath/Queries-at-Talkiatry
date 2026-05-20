@@ -1,0 +1,517 @@
+WITH contacts AS (
+    SELECT
+        TRIM(vc.CONTACT_ID) AS contact_id,
+        vc.CONTACT_NAME AS provider_name,
+        LPAD(REGEXP_REPLACE(TRIM(vc.CONTACT_NPI_NUMBER), '[^0-9]', ''), 10, '0') AS provider_npi,
+        vc.CONTACT_TALKIATRY_PROVIDER_TYPE AS provider_type,
+        TO_DATE(vc.CONTACT_START_DATE) AS start_date,
+        TO_DATE(vc.CONTACT_CREATED_AT) AS sign_date,
+        vc.CONTACT_CREDENTIALING_STATUS AS contact_credentialing_status,
+        vc.CONTACT_INITIAL_CREDENTIALING_APPROVAL AS contact_credentialing_date
+    FROM analytics.staging.stg_verifiable_contact vc
+    WHERE vc.CONTACT_NPI_NUMBER IS NOT NULL
+      AND vc.CONTACT_NAME NOT IN ('VF LA Test', 'AdelineTest LeyTest')
+      AND COALESCE(UPPER(TRIM(vc.CONTACT_PROVIDER_STATUS)), '') NOT IN ('TERMINATED', 'WITHDREW')
+      AND TO_DATE(vc.CONTACT_START_DATE) >= DATEADD(month, -12, CURRENT_DATE())
+),
+
+csr_states AS (
+  SELECT 'AL' AS state UNION ALL SELECT 'CT' UNION ALL SELECT 'DE' UNION ALL SELECT 'DC' UNION ALL SELECT 'GU'
+  UNION ALL SELECT 'HI' UNION ALL SELECT 'ID' UNION ALL SELECT 'IL' UNION ALL SELECT 'IN' UNION ALL SELECT 'IA'
+  UNION ALL SELECT 'LA' UNION ALL SELECT 'MA' UNION ALL SELECT 'MD' UNION ALL SELECT 'MI' UNION ALL SELECT 'MO'
+  UNION ALL SELECT 'NV' UNION ALL SELECT 'NJ' UNION ALL SELECT 'NM' UNION ALL SELECT 'OK' UNION ALL SELECT 'PR'
+  UNION ALL SELECT 'RI' UNION ALL SELECT 'SC' UNION ALL SELECT 'SD' UNION ALL SELECT 'UT' UNION ALL SELECT 'WY'
+),
+
+open_market_states AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(pl.PROVIDER_PRACTICE_LOCATION_STATE)) AS state
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_provider_practice_location pl
+      ON TRIM(pl.PROVIDER_PRACTICE_LOCATION_PROVIDER_ID) = c.contact_id
+    WHERE pl.PROVIDER_PRACTICE_LOCATION_STATE IS NOT NULL
+),
+
+active_license_states_non_pmhnp AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(vl.LICENSE_JURISDICTION_STATE)) AS state
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_licenses vl
+      ON TRIM(vl.LICENSE_PROVIDER_ID) = c.contact_id
+    WHERE UPPER(TRIM(c.provider_type)) <> 'PMHNP'
+      AND vl.IS_LICENSE_ACTIVE = TRUE
+      AND UPPER(TRIM(vl.LICENSE_TALKIATRY_STATUS)) = 'ACTIVE'
+      AND COALESCE(UPPER(TRIM(vl.LICENSE_TYPE_ABBREVIATION)), '') NOT IN ('RN','CSR')
+      AND vl.LICENSE_JURISDICTION_STATE IS NOT NULL
+),
+
+pmhnp_autonomous_license_states AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(vl.LICENSE_JURISDICTION_STATE)) AS state
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_licenses vl
+      ON TRIM(vl.LICENSE_PROVIDER_ID) = c.contact_id
+    WHERE UPPER(TRIM(c.provider_type)) = 'PMHNP'
+      AND vl.IS_LICENSE_ACTIVE = TRUE
+      AND UPPER(TRIM(vl.LICENSE_TALKIATRY_STATUS)) = 'ACTIVE'
+      AND UPPER(TRIM(vl.LICENSE_TYPE_ABBREVIATION)) IN ('NP','PMHNP')
+      AND UPPER(TRIM(COALESCE(vl.IS_LICENSE_AUTONOMY_PRIVILEGE,''))) = UPPER('Yes – State Allows | Fully Eligible')
+      AND vl.LICENSE_JURISDICTION_STATE IS NOT NULL
+),
+
+pmhnp_autonomy_not_filled AS (
+    SELECT
+        c.provider_npi,
+        ARRAY_TO_STRING(
+          ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(UPPER(TRIM(vl.LICENSE_JURISDICTION_STATE))))),
+          ', '
+        ) AS autonomy_not_filled_licenses
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_licenses vl
+      ON TRIM(vl.LICENSE_PROVIDER_ID) = c.contact_id
+    WHERE UPPER(TRIM(c.provider_type)) = 'PMHNP'
+      AND vl.IS_LICENSE_ACTIVE = TRUE
+      AND UPPER(TRIM(vl.LICENSE_TALKIATRY_STATUS)) = 'ACTIVE'
+      AND UPPER(TRIM(vl.LICENSE_TYPE_ABBREVIATION)) IN ('NP','PMHNP')
+      AND (
+            NULLIF(TRIM(vl.IS_LICENSE_AUTONOMY_PRIVILEGE), '') IS NULL
+            OR LOWER(TRIM(vl.IS_LICENSE_AUTONOMY_PRIVILEGE)) ILIKE '%maybe%'
+          )
+      AND LOWER(TRIM(COALESCE(vl.IS_LICENSE_AUTONOMY_PRIVILEGE,''))) NOT ILIKE '%yes%'
+      AND LOWER(TRIM(COALESCE(vl.IS_LICENSE_AUTONOMY_PRIVILEGE,''))) NOT ILIKE '%no%'
+    GROUP BY c.provider_npi
+),
+
+license_apps_in_progress_states AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE)) AS state,
+        INITCAP(LOWER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS))) AS stage
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_licensing_manager__license_application app
+      ON TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_PROVIDER_ID) = c.contact_id
+    WHERE COALESCE(app.IS_LICENSING_MANAGER_LICENSE_APPLICATION_DELETED, FALSE) = FALSE
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE '%COMPLETED%'
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE '%CANCELED%'
+      AND app.LICENSING_MANAGER_LICENSE_APPLICATION_PROVIDER_TYPE NOT LIKE 'RN'
+      AND (
+            COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_TYPE)), '') NOT LIKE '%RENEWAL%'
+        AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)), '') NOT LIKE '%RENEWAL%'
+        AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE '%RENEWAL%'
+      )
+      AND (
+            UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%FULL%'
+         OR UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%COMPACT%'
+         OR UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%STATE%'
+      )
+      AND app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE IS NOT NULL
+),
+
+licenses_in_progress AS (
+    SELECT
+        provider_npi,
+        ARRAY_TO_STRING(
+          ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(state || ' (' || stage || ')'))),
+          ', '
+        ) AS in_progress_licenses
+    FROM license_apps_in_progress_states
+    GROUP BY provider_npi
+),
+
+dea_unrestricted_states AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(d.DEA_NUMBER_STATE)) AS state
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_dea_number d
+      ON TRIM(d.DEA_NUMBER_PROVIDER_ID) = c.contact_id
+    WHERE COALESCE(UPPER(TRIM(d.IS_DEA_NUMBER_ACTIVE::STRING)),'FALSE') = 'TRUE'
+      AND d.DEA_NUMBER_STATE IS NOT NULL
+      AND UPPER(COALESCE(d.DEA_NUMBER_SPECIFICATION,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+),
+
+dea_unrestricted_any AS (
+    SELECT provider_npi, 1 AS has_any_unrestricted_dea
+    FROM dea_unrestricted_states
+    GROUP BY provider_npi
+),
+
+active_deas AS (
+    SELECT
+        c.provider_npi,
+        ARRAY_TO_STRING(
+          ARRAY_SORT(
+            ARRAY_DISTINCT(
+              ARRAY_AGG(
+                CASE
+                  WHEN d.DEA_NUMBER_STATE IS NOT NULL
+                   AND COALESCE(UPPER(TRIM(d.IS_DEA_NUMBER_ACTIVE::STRING)),'FALSE') = 'TRUE'
+                   AND UPPER(COALESCE(d.DEA_NUMBER_SPECIFICATION,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+                  THEN
+                    UPPER(TRIM(d.DEA_NUMBER_STATE))
+                    || CASE
+                         WHEN COALESCE(NULLIF(TRIM(d.DEA_NUMBER_SPECIFICATION), ''), NULL) IS NOT NULL
+                              AND COALESCE(NULLIF(TRIM(d.DEA_NUMBER_DRUG_SCHEDULES), ''), NULL) IS NOT NULL
+                           THEN ' (' || TRIM(d.DEA_NUMBER_SPECIFICATION) || ' - ' || TRIM(d.DEA_NUMBER_DRUG_SCHEDULES) || ')'
+                         WHEN COALESCE(NULLIF(TRIM(d.DEA_NUMBER_SPECIFICATION), ''), NULL) IS NOT NULL
+                           THEN ' (' || TRIM(d.DEA_NUMBER_SPECIFICATION) || ')'
+                         WHEN COALESCE(NULLIF(TRIM(d.DEA_NUMBER_DRUG_SCHEDULES), ''), NULL) IS NOT NULL
+                           THEN ' (' || TRIM(d.DEA_NUMBER_DRUG_SCHEDULES) || ')'
+                         ELSE ''
+                       END
+                END
+              )
+            )
+          ), ', '
+        ) AS active_deas
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_dea_number d
+      ON TRIM(d.DEA_NUMBER_PROVIDER_ID) = c.contact_id
+    WHERE COALESCE(UPPER(TRIM(d.IS_DEA_NUMBER_ACTIVE::STRING)),'FALSE') = 'TRUE'
+      AND UPPER(COALESCE(d.DEA_NUMBER_SPECIFICATION,'')) NOT IN ('TRAINING','LIMITED','TEMPORARY')
+    GROUP BY c.provider_npi
+),
+
+active_deas_excluded_specs AS (
+    SELECT
+        c.provider_npi,
+        ARRAY_TO_STRING(
+          ARRAY_SORT(
+            ARRAY_DISTINCT(
+              ARRAY_AGG(
+                CASE
+                  WHEN d.DEA_NUMBER_STATE IS NOT NULL
+                   AND COALESCE(UPPER(TRIM(d.IS_DEA_NUMBER_ACTIVE::STRING)),'FALSE') = 'TRUE'
+                   AND UPPER(COALESCE(d.DEA_NUMBER_SPECIFICATION,'')) IN ('TRAINING','LIMITED','TEMPORARY')
+                  THEN
+                    UPPER(TRIM(d.DEA_NUMBER_STATE))
+                    || ' ('
+                    || COALESCE(NULLIF(TRIM(d.DEA_NUMBER_SPECIFICATION), ''), 'DEA')
+                    || CASE
+                         WHEN COALESCE(NULLIF(TRIM(d.DEA_NUMBER_DRUG_SCHEDULES), ''), NULL) IS NOT NULL
+                           THEN ' - ' || TRIM(d.DEA_NUMBER_DRUG_SCHEDULES)
+                         ELSE ''
+                       END
+                    || ')'
+                END
+              )
+            )
+          ), ', '
+        ) AS excluded_spec_deas
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_dea_number d
+      ON TRIM(d.DEA_NUMBER_PROVIDER_ID) = c.contact_id
+    WHERE COALESCE(UPPER(TRIM(d.IS_DEA_NUMBER_ACTIVE::STRING)),'FALSE') = 'TRUE'
+      AND UPPER(COALESCE(d.DEA_NUMBER_SPECIFICATION,'')) IN ('TRAINING','LIMITED','TEMPORARY')
+    GROUP BY c.provider_npi
+),
+
+dea_apps_in_progress_states AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE)) AS state,
+        INITCAP(LOWER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS))) AS stage
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_licensing_manager__license_application app
+      ON TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_PROVIDER_ID) = c.contact_id
+    WHERE COALESCE(app.IS_LICENSING_MANAGER_LICENSE_APPLICATION_DELETED, FALSE) = FALSE
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE '%COMPLETED%'
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE '%CANCELED%'
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_TYPE)), '') NOT LIKE '%RENEWAL%'
+      AND UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%DEA%'
+      AND app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE IS NOT NULL
+),
+
+dea_in_progress AS (
+    SELECT
+        provider_npi,
+        ARRAY_TO_STRING(
+          ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(state || ' (' || stage || ')'))),
+          ', '
+        ) AS in_progress_deas
+    FROM dea_apps_in_progress_states
+    GROUP BY provider_npi
+),
+
+csr_active_states AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(vl.LICENSE_JURISDICTION_STATE)) AS state
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_licenses vl
+      ON TRIM(vl.LICENSE_PROVIDER_ID) = c.contact_id
+    WHERE UPPER(TRIM(vl.LICENSE_TYPE_ABBREVIATION)) = 'CSR'
+      AND vl.IS_LICENSE_ACTIVE = TRUE
+      AND UPPER(TRIM(vl.LICENSE_TALKIATRY_STATUS)) = 'ACTIVE'
+      AND vl.LICENSE_JURISDICTION_STATE IS NOT NULL
+),
+
+csr_apps_in_progress_states AS (
+    SELECT DISTINCT
+        c.provider_npi,
+        UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE)) AS state,
+        INITCAP(LOWER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS))) AS stage
+    FROM contacts c
+    JOIN analytics.staging.stg_verifiable_licensing_manager__license_application app
+      ON TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_PROVIDER_ID) = c.contact_id
+    WHERE COALESCE(app.IS_LICENSING_MANAGER_LICENSE_APPLICATION_DELETED, FALSE) = FALSE
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE '%COMPLETED%'
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_STATUS)), '') NOT LIKE '%CANCELED%'
+      AND COALESCE(UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_TYPE)), '') <> 'RENEWAL'
+      AND UPPER(TRIM(app.LICENSING_MANAGER_LICENSE_APPLICATION_CREDENTIAL_TYPE)) LIKE '%CSR%'
+      AND app.LICENSING_MANAGER_LICENSE_APPLICATION_STATE IS NOT NULL
+),
+
+active_csrs AS (
+    SELECT
+        provider_npi,
+        ARRAY_TO_STRING(ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(state))), ', ') AS active_csrs
+    FROM csr_active_states
+    GROUP BY provider_npi
+),
+
+csr_in_progress AS (
+    SELECT
+        provider_npi,
+        ARRAY_TO_STRING(
+          ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(state || ' (' || stage || ')'))),
+          ', '
+        ) AS in_progress_csrs
+    FROM csr_apps_in_progress_states
+    GROUP BY provider_npi
+),
+
+open_markets_display AS (
+    SELECT
+        provider_npi,
+        ARRAY_TO_STRING(ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(state))), ', ') AS open_markets
+    FROM open_market_states
+    GROUP BY provider_npi
+),
+
+active_licenses_non_pmhnp AS (
+    SELECT
+        provider_npi,
+        ARRAY_TO_STRING(ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(state))), ', ') AS active_licenses
+    FROM active_license_states_non_pmhnp
+    GROUP BY provider_npi
+),
+
+pmhnp_autonomous_licenses AS (
+    SELECT
+        provider_npi,
+        ARRAY_TO_STRING(ARRAY_SORT(ARRAY_DISTINCT(ARRAY_AGG(state))), ', ') AS autonomous_licenses
+    FROM pmhnp_autonomous_license_states
+    GROUP BY provider_npi
+),
+
+market_state_driver AS (
+    SELECT provider_npi, state FROM open_market_states
+    UNION
+    SELECT provider_npi, state FROM active_license_states_non_pmhnp
+    UNION
+    SELECT provider_npi, state FROM pmhnp_autonomous_license_states
+),
+
+market_eval AS (
+    SELECT
+        c.provider_npi,
+        c.provider_type,
+        msd.state,
+
+        CASE
+          WHEN UPPER(TRIM(c.provider_type)) = 'PMHNP' THEN CASE WHEN pal.state IS NOT NULL THEN 1 ELSE 0 END
+          ELSE CASE WHEN aln.state IS NOT NULL THEN 1 ELSE 0 END
+        END AS license_ok,
+
+        /* apply DEA/CSR checks only for MD/DO/PMHNP */
+        CASE WHEN UPPER(TRIM(c.provider_type)) IN ('MD','DO','PMHNP') THEN 1 ELSE 0 END AS dea_csr_required,
+
+        CASE
+          WHEN UPPER(TRIM(c.provider_type)) NOT IN ('MD','DO','PMHNP') THEN 1
+          WHEN dus.state IS NOT NULL THEN 1
+          WHEN msd.state NOT IN ('GA','CA') AND dua.has_any_unrestricted_dea = 1 THEN 1
+          ELSE 0
+        END AS dea_ok,
+
+        CASE WHEN dap.state IS NOT NULL THEN 1 ELSE 0 END AS dea_in_progress,
+
+        CASE
+          WHEN UPPER(TRIM(c.provider_type)) IN ('MD','DO','PMHNP') AND cs.state IS NOT NULL THEN 1
+          ELSE 0
+        END AS csr_required,
+
+        CASE
+          WHEN NOT (UPPER(TRIM(c.provider_type)) IN ('MD','DO','PMHNP') AND cs.state IS NOT NULL) THEN 1
+          WHEN cas.state IS NOT NULL THEN 1
+          ELSE 0
+        END AS csr_ok,
+
+        CASE WHEN cap.state IS NOT NULL THEN 1 ELSE 0 END AS csr_in_progress
+
+    FROM contacts c
+    JOIN market_state_driver msd
+      ON msd.provider_npi = c.provider_npi
+
+    LEFT JOIN pmhnp_autonomous_license_states pal
+      ON pal.provider_npi = c.provider_npi AND pal.state = msd.state
+    LEFT JOIN active_license_states_non_pmhnp aln
+      ON aln.provider_npi = c.provider_npi AND aln.state = msd.state
+
+    LEFT JOIN dea_unrestricted_states dus
+      ON dus.provider_npi = c.provider_npi AND dus.state = msd.state
+    LEFT JOIN dea_unrestricted_any dua
+      ON dua.provider_npi = c.provider_npi
+
+    LEFT JOIN dea_apps_in_progress_states dap
+      ON dap.provider_npi = c.provider_npi AND dap.state = msd.state
+
+    LEFT JOIN csr_states cs
+      ON cs.state = msd.state
+    LEFT JOIN csr_active_states cas
+      ON cas.provider_npi = c.provider_npi AND cas.state = msd.state
+
+    LEFT JOIN csr_apps_in_progress_states cap
+      ON cap.provider_npi = c.provider_npi AND cap.state = msd.state
+),
+
+market_rollup AS (
+    SELECT
+        provider_npi,
+
+        LISTAGG(
+          CASE
+            WHEN license_ok = 1
+             AND (
+               dea_csr_required = 0
+               OR (dea_ok = 1 AND csr_ok = 1)
+             )
+            THEN state
+          END,
+          ', '
+        ) WITHIN GROUP (ORDER BY state) AS complete_markets,
+
+        LISTAGG(
+          CASE
+            WHEN license_ok = 1
+             AND NOT (
+               dea_csr_required = 0
+               OR (dea_ok = 1 AND csr_ok = 1)
+             )
+            THEN
+              state || ' (' ||
+              RTRIM(
+                CONCAT(
+                  CASE
+                    WHEN dea_csr_required = 1 AND dea_ok = 0 AND dea_in_progress = 1 THEN 'DEA In Progress, '
+                    WHEN dea_csr_required = 1 AND dea_ok = 0 THEN 'DEA Needed, '
+                    ELSE ''
+                  END,
+                  CASE
+                    WHEN csr_required = 1 AND csr_ok = 0 AND csr_in_progress = 1 THEN 'CSR In Progress, '
+                    WHEN csr_required = 1 AND csr_ok = 0 THEN 'CSR Needed, '
+                    ELSE ''
+                  END
+                ),
+                ', '
+              )
+              || ')'
+          END,
+          ', '
+        ) WITHIN GROUP (ORDER BY state) AS incomplete_markets
+
+    FROM market_eval
+    WHERE license_ok = 1
+    GROUP BY provider_npi
+),
+
+ny_tx_flag AS (
+    SELECT
+      c.provider_npi,
+      CASE
+        WHEN
+          EXISTS (
+            SELECT 1
+            FROM pmhnp_autonomous_license_states s
+            WHERE s.provider_npi = c.provider_npi AND s.state IN ('NY','TX')
+          )
+          OR
+          EXISTS (
+            SELECT 1
+            FROM active_license_states_non_pmhnp s
+            WHERE s.provider_npi = c.provider_npi AND s.state IN ('NY','TX')
+          )
+          OR
+          EXISTS (
+            SELECT 1
+            FROM license_apps_in_progress_states s
+            WHERE s.provider_npi = c.provider_npi AND s.state IN ('NY','TX')
+          )
+        THEN 'Yes' ELSE 'No'
+      END AS ny_or_tx_license
+    FROM contacts c
+)
+
+SELECT
+    c.provider_name AS "Provider Name",
+    c.provider_type AS "Provider Type",
+    c.provider_npi AS "Contact NPI Number",
+    c.sign_date AS "Sign Date",
+    c.start_date AS "Start Date",
+    c.contact_credentialing_status AS "Contact Credentialing Status",
+    c.contact_credentialing_date AS "Contact Credentialing Date",
+
+    CASE
+      WHEN UPPER(TRIM(c.provider_type)) = 'PMHNP' THEN COALESCE(pa.autonomous_licenses, '')
+      ELSE COALESCE(al.active_licenses, '')
+    END AS "Active Licenses",
+
+    CASE
+      WHEN UPPER(TRIM(c.provider_type)) = 'PMHNP' THEN COALESCE(panf.autonomy_not_filled_licenses, '')
+      ELSE ''
+    END AS "Active Licenses - Autonomy Not Filled",
+
+    COALESCE(mr.complete_markets, '')   AS "Complete Markets (License, DEA, CSR)",
+    COALESCE(mr.incomplete_markets, '') AS "Incomplete Markets",
+
+    COALESCE(omd.open_markets, '') AS "Open Markets",
+    COALESCE(lip.in_progress_licenses, '') AS "In Progress Licenses",
+
+    COALESCE(nt.ny_or_tx_license, 'No') AS "NY or TX license",
+
+    COALESCE(ad.active_deas, '') AS "Active DEAs (Prescribing Info Included)",
+    COALESCE(adx.excluded_spec_deas, '') AS "Active DEAs - Excluded Specs (Training/Limited/Temporary)",
+    COALESCE(dip.in_progress_deas, '') AS "In Progress DEAs",
+    COALESCE(ac.active_csrs, '') AS "Active CSRs",
+    COALESCE(cip.in_progress_csrs, '') AS "In Progress CSRs"
+
+FROM contacts c
+LEFT JOIN active_licenses_non_pmhnp al
+  ON al.provider_npi = c.provider_npi
+LEFT JOIN pmhnp_autonomous_licenses pa
+  ON pa.provider_npi = c.provider_npi
+LEFT JOIN pmhnp_autonomy_not_filled panf
+  ON panf.provider_npi = c.provider_npi
+LEFT JOIN open_markets_display omd
+  ON omd.provider_npi = c.provider_npi
+LEFT JOIN licenses_in_progress lip
+  ON lip.provider_npi = c.provider_npi
+LEFT JOIN active_deas ad
+  ON ad.provider_npi = c.provider_npi
+LEFT JOIN active_deas_excluded_specs adx
+  ON adx.provider_npi = c.provider_npi
+LEFT JOIN dea_in_progress dip
+  ON dip.provider_npi = c.provider_npi
+LEFT JOIN active_csrs ac
+  ON ac.provider_npi = c.provider_npi
+LEFT JOIN csr_in_progress cip
+  ON cip.provider_npi = c.provider_npi
+LEFT JOIN market_rollup mr
+  ON mr.provider_npi = c.provider_npi
+LEFT JOIN ny_tx_flag nt
+  ON nt.provider_npi = c.provider_npi
+
+ORDER BY c.start_date DESC
