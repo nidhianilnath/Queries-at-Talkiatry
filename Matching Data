@@ -1,0 +1,75 @@
+WITH filtered_emps AS (
+    SELECT
+        e.employee_ecw_user_id                     AS provider_id
+      , e.employee_npi                             AS provider_npi
+      , e.employee_full_name                       AS provider_name
+      , TO_DATE(e.employee_current_start_date)     AS employee_start_date
+    FROM analytics.common.dim_employees e
+    WHERE e.provider_type IN ('Doctor', 'Nurse Practitioner')
+      AND TO_DATE(e.employee_current_start_date) >= DATEADD(MONTH, -12, CURRENT_DATE)
+),
+
+assessment_weekly AS (
+    SELECT
+        amvs.matched_provider_ecw_user_id                  AS provider_id
+      , DATE_TRUNC('WEEK', amvs.match_date)::DATE          AS week_start
+      , SUM(CASE
+            WHEN amvs.is_provider_matched = 1
+              OR amvs.is_provider_matched = TRUE
+            THEN 1 ELSE 0
+        END)                                               AS offered_weekly
+      , SUM(CASE
+            WHEN amvs.is_provider_selected = 1
+              OR amvs.is_provider_selected = TRUE
+            THEN 1 ELSE 0
+        END)                                               AS selected_weekly
+    FROM analytics.products.assessment_match_vs_selected amvs
+    GROUP BY 1, 2
+),
+
+first_offer_week AS (
+    SELECT
+        fe.provider_id
+      , MIN(aw.week_start) AS first_offer_week
+    FROM filtered_emps fe
+    JOIN assessment_weekly aw
+      ON aw.provider_id = fe.provider_id
+     AND aw.offered_weekly > 0
+    GROUP BY fe.provider_id
+),
+
+rollup_4w AS (
+    SELECT
+        fow.provider_id
+      , fow.first_offer_week
+      , SUM(CASE
+            WHEN aw.week_start BETWEEN fow.first_offer_week
+                                   AND DATEADD(DAY, 27, fow.first_offer_week)
+            THEN aw.offered_weekly ELSE 0
+        END) AS offered_4w
+      , SUM(CASE
+            WHEN aw.week_start BETWEEN fow.first_offer_week
+                                   AND DATEADD(DAY, 27, fow.first_offer_week)
+            THEN aw.selected_weekly ELSE 0
+        END) AS selected_4w
+    FROM first_offer_week fow
+    JOIN assessment_weekly aw
+      ON aw.provider_id = fow.provider_id
+    GROUP BY
+        fow.provider_id
+      , fow.first_offer_week
+)
+
+SELECT
+    fe.provider_npi
+  , fe.provider_name
+  , fe.employee_start_date
+  , r4.first_offer_week
+  , COALESCE(r4.offered_4w, 0)   AS offered_4w
+  , COALESCE(r4.selected_4w, 0)  AS selected_4w
+FROM filtered_emps fe
+LEFT JOIN rollup_4w r4
+  ON r4.provider_id = fe.provider_id
+ORDER BY
+    fe.employee_start_date DESC
+  , fe.provider_npi
