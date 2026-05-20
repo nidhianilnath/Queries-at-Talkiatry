@@ -1,0 +1,5 @@
+select 
+contact_npi_number,
+is_contact_market_audit_complete,
+market_audit_callouts
+from analytics.staging.stg_verifiable_contact
