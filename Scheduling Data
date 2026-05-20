@@ -1,0 +1,141 @@
+WITH providers AS (
+    SELECT 
+        e.employee_id,
+        e.employee_ecw_user_id AS provider_ecw_id,
+        e.employee_full_name   AS provider_name,
+        e.employee_npi         AS provider_npi,
+        GREATEST(
+            e.employee_earliest_start_date,
+            e.employee_current_start_date,
+            e.employee_last_start_date
+        ) AS provider_start_date,
+
+        /* Provider classification */
+        CASE 
+            WHEN UPPER(e.employee_cost_number_ou_name) LIKE ANY (
+                '%PSYCHIATRIST%', '%MD%', '%DO%', '%PMHNP%', '%NURSE PRACTITIONER%', '%NP%'
+            ) THEN 'MED'
+            WHEN UPPER(e.employee_cost_number_ou_name) LIKE ANY (
+                '%THERAPIST%', '%LCSW%', '%LPC%', '%PSYCHOLOGIST%'
+            ) THEN 'THERAPIST'
+            ELSE 'OTHER'
+        END AS provider_group
+
+    FROM analytics.common.dim_employees e
+    WHERE e.employee_ecw_user_id IS NOT NULL
+      AND e.employee_separation_date IS NULL
+),
+
+provider_weeks AS (
+    SELECT
+        p.provider_ecw_id,
+        p.provider_name,
+        p.provider_npi,
+        p.provider_group,
+        p.provider_start_date,
+        seq.seq_num AS week_number,
+        DATEADD('day', (seq.seq_num - 1) * 7, p.provider_start_date) AS week_start,
+        DATEADD('day',  seq.seq_num      * 7 - 1, p.provider_start_date) AS week_end
+    FROM providers p
+    JOIN (
+        SELECT SEQ4() + 1 AS seq_num
+        FROM TABLE(GENERATOR(ROWCOUNT => 4))
+    ) seq
+    WHERE p.provider_group IN ('MED', 'THERAPIST')
+),
+
+/* STEP A: Pull visits and keep future scheduled visits, excluding canceled/no-show */
+raw_visits AS (
+    SELECT
+        fv.visit_id,
+        fv.visit_provider_id AS provider_ecw_id,
+        fv.visit_date,
+        fv.visit_type_category,
+        fv.patient_id,
+        fv.is_visit_scheduled,
+        fv.is_visit_complete,
+        fv.is_visit_canceled,
+        fv.is_visit_no_show
+    FROM analytics.common.fct_visits fv
+    WHERE fv.visit_id IS NOT NULL
+      AND COALESCE(fv.is_visit_canceled, FALSE) = FALSE
+      AND COALESCE(fv.is_visit_no_show, FALSE) = FALSE
+      AND (fv.is_visit_scheduled = TRUE OR fv.is_visit_complete = TRUE)
+),
+
+/* STEP B: Dedupe to 1 row per visit_id */
+deduped_visits AS (
+    SELECT *
+    FROM raw_visits
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY visit_id
+        ORDER BY visit_date DESC
+    ) = 1
+),
+
+/* STEP C: Compute "first visit date with provider" per patient-provider pair (based on deduped visits) */
+visits_with_first AS (
+    SELECT
+        v.*,
+        MIN(v.visit_date) OVER (PARTITION BY v.provider_ecw_id, v.patient_id) AS first_visit_date_with_provider
+    FROM deduped_visits v
+),
+
+/* STEP D: For each provider-week, compute the right metric by provider_group */
+weekly_counts AS (
+    SELECT
+        pw.provider_ecw_id,
+        pw.provider_name,
+        pw.provider_npi,
+        pw.provider_group,
+        pw.provider_start_date,
+        pw.week_number,
+
+        /* MED: unique NEW patients whose first provider visit falls within that week */
+        COUNT(DISTINCT CASE
+            WHEN pw.provider_group = 'MED'
+             AND v.first_visit_date_with_provider BETWEEN pw.week_start AND pw.week_end
+            THEN v.patient_id
+        END) AS med_new_unique_patients,
+
+        /* THERAPIST: total scheduled visits in that week (visit_id is already deduped) */
+        COUNT(CASE
+            WHEN pw.provider_group = 'THERAPIST'
+             AND v.visit_date BETWEEN pw.week_start AND pw.week_end
+            THEN v.visit_id
+        END) AS therapist_total_scheduled_visits
+
+    FROM provider_weeks pw
+    LEFT JOIN visits_with_first v
+      ON v.provider_ecw_id = pw.provider_ecw_id
+     /* keep join bounded to the 4-week window to reduce scan + keep first-visit logic relevant */
+     AND v.visit_date BETWEEN pw.provider_start_date AND DATEADD('day', 27, pw.provider_start_date)
+
+    GROUP BY
+        pw.provider_ecw_id, pw.provider_name, pw.provider_npi,
+        pw.provider_group, pw.provider_start_date, pw.week_number
+),
+
+/* STEP E: Pivot weeks 1–4 into columns + total */
+pivoted AS (
+    SELECT
+        provider_ecw_id,
+        provider_npi,
+        provider_name,
+        provider_group,
+        provider_start_date,
+
+        MAX(CASE WHEN week_number = 1 THEN IFF(provider_group='MED', med_new_unique_patients, therapist_total_scheduled_visits) ELSE 0 END) AS week_1,
+        MAX(CASE WHEN week_number = 2 THEN IFF(provider_group='MED', med_new_unique_patients, therapist_total_scheduled_visits) ELSE 0 END) AS week_2,
+        MAX(CASE WHEN week_number = 3 THEN IFF(provider_group='MED', med_new_unique_patients, therapist_total_scheduled_visits) ELSE 0 END) AS week_3,
+        MAX(CASE WHEN week_number = 4 THEN IFF(provider_group='MED', med_new_unique_patients, therapist_total_scheduled_visits) ELSE 0 END) AS week_4,
+
+        SUM(IFF(provider_group='MED', med_new_unique_patients, therapist_total_scheduled_visits)) AS total_4_weeks
+
+    FROM weekly_counts
+    GROUP BY provider_ecw_id, provider_npi, provider_name, provider_group, provider_start_date
+)
+
+SELECT *
+FROM pivoted
+ORDER BY provider_start_date DESC
