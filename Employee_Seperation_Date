@@ -1,0 +1,4 @@
+select 
+employee_npi, 
+EMPLOYEE_SEPARATION_DATE
+from analytics.common.dim_employees
